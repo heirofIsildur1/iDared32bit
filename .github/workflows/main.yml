@@ -1,0 +1,50 @@
+name: Build iDared32bit Unsigned IPA
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch: # Allows you to manually click "Run workflow" in GitHub
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Force Unsigned Xcode Archive
+        run: |
+          cd iphone
+          xcodebuild archive \
+            -project iDared32bit.xcodeproj \
+            -scheme "iDared32bit" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -archivePath $RUNNER_TEMP/iDared32bit.xcarchive \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS=""
+
+      - name: Package App into Unsigned IPA
+        run: |
+          # 1. Create a Payload folder
+          mkdir -p $RUNNER_TEMP/Payload
+          
+          # 2. Copy the built .app binary into the Payload folder
+          cp -r $RUNNER_TEMP/iDared32bit.xcarchive/Products/Applications/*.app $RUNNER_TEMP/Payload/
+          
+          # 3. Zip the Payload folder and name it .ipa
+          cd $RUNNER_TEMP
+          zip -r iDared32bit-Unsigned.ipa Payload
+          
+          # 4. Move it back to GitHub's workspace so the script can see it
+          mv iDared32bit-Unsigned.ipa $GITHUB_WORKSPACE/
+
+      - name: Upload IPA to GitHub Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: idared32bit-unsigned-build
+          path: iDared32bit-Unsigned.ipa
+          if-no-files-found: error
