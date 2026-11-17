@@ -1,0 +1,49 @@
+name: Build iDared32bit Unsigned IPA
+
+on:
+  push:
+    branches: [ "main", "idared32bit" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust and iOS Target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+
+      - name: Force Unsigned Xcode Archive
+        run: |
+          xcodebuild clean archive \
+            -project iphone/iDared32bit.xcodeproj \
+            -scheme "iDared 32bit" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/iDared32bit.xcarchive" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_IDENTITY=""
+
+      - name: Package App into Unsigned IPA
+        run: |
+          mkdir -p "$RUNNER_TEMP/Payload"
+          cp -r "$RUNNER_TEMP/iDared32bit.xcarchive/Products/Applications/"*.app "$RUNNER_TEMP/Payload/"
+          cd "$RUNNER_TEMP"
+          zip -r iDared32bit-Unsigned.ipa Payload
+          mv iDared32bit-Unsigned.ipa "$GITHUB_WORKSPACE/"
+
+      - name: Upload IPA to GitHub Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: idared32bit-unsigned-build
+          path: iDared32bit-Unsigned.ipa
+          if-no-files-found: error
