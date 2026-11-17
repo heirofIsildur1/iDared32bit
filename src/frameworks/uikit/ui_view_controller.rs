@@ -8,17 +8,21 @@
 //! Resources:
 //! - [View Controller Programming Guide for iOS (Legacy)](https://developer.apple.com/library/archive/documentation/WindowsViews/Conceptual/ViewControllerPGforiOSLegacy/BasicViewControllers/BasicViewControllers.html)
 
-use crate::frameworks::core_graphics::CGRect;
+use crate::frameworks::core_graphics::cg_affine_transform::CGAffineTransform;
+use crate::frameworks::core_graphics::{CGPoint, CGRect};
 use crate::frameworks::foundation::ns_objc_runtime::NSStringFromClass;
 use crate::frameworks::foundation::ns_string::{from_rust_string, get_static_str, to_rust_string};
-use crate::frameworks::foundation::NSInteger;
+use crate::frameworks::foundation::{NSInteger, NSUInteger};
 use crate::frameworks::uikit::ui_application::{
     UIInterfaceOrientation, UIInterfaceOrientationPortrait,
 };
+use crate::frameworks::uikit::ui_bar_item::ui_bar_button_item::{
+    UIBarButtonItemStyleBordered, UIBarButtonItemStyleDone,
+};
 use crate::frameworks::uikit::ui_view::set_view_controller;
 use crate::objc::{
-    id, msg, msg_class, nil, objc_classes, release, retain, todo_objc_setter, Class, ClassExports,
-    HostObject, NSZonePtr,
+    autorelease, id, msg, msg_class, nil, objc_classes, release, retain, todo_objc_setter, Class,
+    ClassExports, HostObject, NSZonePtr,
 };
 use crate::Environment;
 
@@ -37,6 +41,16 @@ struct UIViewControllerHostObject {
     /// of the nib by name, may be nil.
     /// `NSBundle*`
     bundle: id,
+    /// The view controller this one presents modally, retained.
+    modal_view_controller: id,
+    /// The view controller presenting this one modally. Weak.
+    parent_view_controller: id,
+    /// The window's root view, hidden (removed) while a modal view controller
+    /// covers it, and its index in the window. Retained.
+    covered_view: Option<(id, NSUInteger)>,
+    editing: bool,
+    /// Made when first asked for. Retained.
+    edit_button_item: id,
 }
 impl HostObject for UIViewControllerHostObject {}
 
@@ -77,7 +91,16 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())dealloc {
-    let &UIViewControllerHostObject { view, nib_name, bundle } = env.objc.borrow(this);
+    let &UIViewControllerHostObject {
+        view,
+        nib_name,
+        bundle,
+        modal_view_controller,
+        edit_button_item,
+        ..
+    } = env.objc.borrow(this);
+    release(env, modal_view_controller);
+    release(env, edit_button_item);
 
     if view != nil {
         set_view_controller(env, view, nil);
@@ -178,8 +201,51 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (())setTitle:(id)title { // NSString *
     todo_objc_setter!(this, to_rust_string(env, title));
 }
+- (bool)isEditing {
+    env.objc.borrow::<UIViewControllerHostObject>(this).editing
+}
 - (())setEditing:(bool)editing {
-    todo_objc_setter!(this, editing);
+    () = msg![env; this setEditing:editing animated:false];
+}
+// Subclasses (like a table view controller) also change their views.
+- (())setEditing:(bool)editing animated:(bool)_animated {
+    env.objc.borrow_mut::<UIViewControllerHostObject>(this).editing = editing;
+    let item = env.objc.borrow::<UIViewControllerHostObject>(this).edit_button_item;
+    if item != nil {
+        let (title, style) = if editing {
+            ("Done", UIBarButtonItemStyleDone)
+        } else {
+            ("Edit", UIBarButtonItemStyleBordered)
+        };
+        let title = get_static_str(env, title);
+        () = msg![env; item setTitle:title];
+        () = msg![env; item setStyle:style];
+    }
+}
+// A button that switches between Edit and Done, toggling editing.
+- (id)editButtonItem {
+    let item = env.objc.borrow::<UIViewControllerHostObject>(this).edit_button_item;
+    if item != nil {
+        return item;
+    }
+    let editing = env.objc.borrow::<UIViewControllerHostObject>(this).editing;
+    let (title, style) = if editing {
+        ("Done", UIBarButtonItemStyleDone)
+    } else {
+        ("Edit", UIBarButtonItemStyleBordered)
+    };
+    let title = get_static_str(env, title);
+    let action = env
+        .objc
+        .register_host_selector("_touchHLE_toggleEditing".to_string(), &mut env.mem);
+    let item: id = msg_class![env; UIBarButtonItem alloc];
+    let item: id = msg![env; item initWithTitle:title style:style target:this action:action];
+    env.objc.borrow_mut::<UIViewControllerHostObject>(this).edit_button_item = item;
+    item
+}
+- (())_touchHLE_toggleEditing {
+    let editing: bool = msg![env; this isEditing];
+    () = msg![env; this setEditing:(!editing) animated:true];
 }
 - (())setWantsFullScreenLayout:(bool)wants {
     todo_objc_setter!(this, wants);
@@ -191,8 +257,98 @@ pub const CLASSES: ClassExports = objc_classes! {
     todo_objc_setter!(this, style);
 }
 
+- (id)modalViewController {
+    env.objc.borrow::<UIViewControllerHostObject>(this).modal_view_controller
+}
+// TODO: also the navigation controller for the controllers it pushes.
+- (id)parentViewController {
+    env.objc.borrow::<UIViewControllerHostObject>(this).parent_view_controller
+}
+
+// Like iPhone OS 3, the modal view covers the whole window. There's no
+// slide animation: it appears and disappears at once.
+- (())presentModalViewController:(id)modal // UIViewController*
+                         animated:(bool)animated {
+    if env.objc.borrow::<UIViewControllerHostObject>(this).modal_view_controller != nil {
+        log!("Warning: {:?} is already presenting a modal view controller", this);
+        return;
+    }
+    retain(env, modal);
+    env.objc.borrow_mut::<UIViewControllerHostObject>(this).modal_view_controller = modal;
+    env.objc.borrow_mut::<UIViewControllerHostObject>(modal).parent_view_controller = this;
+
+    // The root view of the window this controller's view is in.
+    let view: id = msg![env; this view];
+    let mut window: id = msg![env; view window];
+    if window == nil {
+        let app: id = msg_class![env; UIApplication sharedApplication];
+        window = msg![env; app keyWindow];
+    }
+    let mut root = view;
+    loop {
+        let superview: id = msg![env; root superview];
+        if superview == window || superview == nil {
+            break;
+        }
+        root = superview;
+    }
+    let root_superview: id = msg![env; root superview];
+    let root = if root_superview == window { root } else { nil };
+
+    let modal_view: id = msg![env; modal view];
+    () = msg![env; modal viewWillAppear:animated];
+    () = msg![env; this viewWillDisappear:animated];
+    if root != nil {
+        let transform: CGAffineTransform = msg![env; root transform];
+        let bounds: CGRect = msg![env; root bounds];
+        let center: CGPoint = msg![env; root center];
+        () = msg![env; modal_view setTransform:transform];
+        () = msg![env; modal_view setBounds:bounds];
+        () = msg![env; modal_view setCenter:center];
+        let subviews: id = msg![env; window subviews];
+        let index: NSUInteger = msg![env; subviews indexOfObject:root];
+        retain(env, root);
+        () = msg![env; window addSubview:modal_view];
+        () = msg![env; root removeFromSuperview];
+        env.objc.borrow_mut::<UIViewControllerHostObject>(this).covered_view = Some((root, index));
+    } else {
+        let screen: id = msg_class![env; UIScreen mainScreen];
+        let frame: CGRect = msg![env; screen applicationFrame];
+        () = msg![env; modal_view setFrame:frame];
+        () = msg![env; window addSubview:modal_view];
+    }
+    () = msg![env; modal viewDidAppear:animated];
+    () = msg![env; this viewDidDisappear:animated];
+}
+
 - (())dismissModalViewControllerAnimated:(bool)animated {
-    log!("TODO: [(UIViewController*){:?} dismissModalViewControllerAnimated:{}]", this, animated); // TODO
+    let host_obj = env.objc.borrow::<UIViewControllerHostObject>(this);
+    let (modal, parent) = (host_obj.modal_view_controller, host_obj.parent_view_controller);
+    if modal == nil {
+        // Sent to the modal view controller itself: its presenter dismisses it.
+        if parent != nil {
+            () = msg![env; parent dismissModalViewControllerAnimated:animated];
+        }
+        return;
+    }
+
+    () = msg![env; modal viewWillDisappear:animated];
+    () = msg![env; this viewWillAppear:animated];
+    let modal_view: id = msg![env; modal view];
+    let window: id = msg![env; modal_view window];
+    let covered = env.objc.borrow_mut::<UIViewControllerHostObject>(this).covered_view.take();
+    if let Some((root, index)) = covered {
+        () = msg![env; window insertSubview:root atIndex:(index as NSInteger)];
+        release(env, root);
+    }
+    () = msg![env; modal_view removeFromSuperview];
+    () = msg![env; modal viewDidDisappear:animated];
+    () = msg![env; this viewDidAppear:animated];
+
+    env.objc.borrow_mut::<UIViewControllerHostObject>(modal).parent_view_controller = nil;
+    env.objc.borrow_mut::<UIViewControllerHostObject>(this).modal_view_controller = nil;
+    // The modal view controller is often what's dismissing itself.
+    autorelease(env, modal);
 }
 - (())dismissMoviePlayerViewControllerAnimated {
     log!("TODO: [(UIViewController*){:?} dismissMoviePlayerViewControllerAnimated]", this); // TODO

@@ -9,7 +9,7 @@ use crate::abi::{CallFromHost, GuestFunction};
 use crate::dyld::{export_c_func, export_c_func_aliased, FunctionExports};
 use crate::fs::{resolve_path, GuestPath};
 use crate::libc::clocale::{setlocale, LC_CTYPE};
-use crate::libc::errno::{set_errno, EINVAL};
+use crate::libc::errno::{set_errno, EEXIST, EINVAL, ENAMETOOLONG, ENOTDIR};
 use crate::libc::string::strlen;
 use crate::libc::wchar::wchar_t;
 use crate::mem::{ConstPtr, ConstVoidPtr, GuestUSize, MutPtr, MutVoidPtr, Ptr, SafeRead};
@@ -25,6 +25,7 @@ pub struct State {
     random: u32,
     arc4random: u32,
     fcvt_buf: Option<MutPtr<u8>>,
+    basename_buf: Option<MutPtr<u8>>,
 }
 
 // Sizes of zero are implementation-defined. macOS will happily give you back
@@ -497,6 +498,37 @@ fn strtol(env: &mut Environment, str: ConstPtr<u8>, endptr: MutPtr<MutPtr<u8>>, 
     }
 }
 
+fn strtoll(env: &mut Environment, str: ConstPtr<u8>, endptr: MutPtr<MutPtr<u8>>, base: i32) -> i64 {
+    // TODO: handle errno properly
+    set_errno(env, 0);
+
+    let parse_res = str_to_int_inner_generic(
+        env,
+        |env, s, idx| Ok(env.mem.read(s + idx)),
+        |_, _, _| (), // could be ignored
+        str.cast_mut(),
+        0, // starting offset
+        base.try_into().unwrap(),
+        u32::MAX, // max_length
+        |s, base| i64::from_str_radix(s, base).unwrap_or(i64::MAX),
+        |num| num.checked_mul(-1).unwrap_or(i64::MIN),
+    );
+    match parse_res {
+        Ok((res, len)) => {
+            if !endptr.is_null() {
+                env.mem.write(endptr, (str + len).cast_mut());
+            }
+            res
+        }
+        Err(_) => {
+            if !endptr.is_null() {
+                env.mem.write(endptr, str.cast_mut());
+            }
+            0
+        }
+    }
+}
+
 fn wcstol(
     env: &mut Environment,
     nptr: ConstPtr<wchar_t>,
@@ -662,6 +694,83 @@ fn fcvt(
     fcvt_buf
 }
 
+/// Replaces the `X`s at the end of `template` to make the name of a file
+/// that doesn't exist yet. Like iOS, it doesn't create the file.
+fn mktemp(env: &mut Environment, template: MutPtr<u8>) -> MutPtr<u8> {
+    set_errno(env, 0);
+    let mut name = env.mem.cstr_at(template.cast_const()).to_vec();
+    let x_count = name.iter().rev().take_while(|&&c| c == b'X').count();
+    let start = name.len() - x_count;
+
+    // As on iOS, a missing folder is fine (only mkstemp() checks), but not
+    // one that's a file, where looking the name up fails.
+    if let Some(slash) = name.iter().rposition(|&c| c == b'/') {
+        let folder = String::from_utf8_lossy(&name[..slash.max(1)]).into_owned();
+        let folder = GuestPath::new(&folder);
+        if env.fs.exists(folder) && !env.fs.is_dir(folder) {
+            set_errno(env, ENOTDIR);
+            return Ptr::null();
+        }
+    }
+
+    const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    for _ in 0..1000 {
+        let random = uuid::Uuid::new_v4().as_u128();
+        for (i, c) in name[start..].iter_mut().enumerate() {
+            *c = CHARS[((random >> (i % 21 * 6)) % CHARS.len() as u128) as usize];
+        }
+        let path = String::from_utf8_lossy(&name).into_owned();
+        if !env.fs.exists(GuestPath::new(&path)) {
+            env.mem
+                .bytes_at_mut(template, name.len() as GuestUSize)
+                .copy_from_slice(&name);
+            log_dbg!("mktemp() => {:?}", path);
+            return template;
+        }
+        if x_count == 0 {
+            break;
+        }
+    }
+    set_errno(env, EEXIST);
+    Ptr::null()
+}
+
+/// `libgen.h`: the last part of a path. As on iOS, it's in a buffer that the
+/// next call overwrites.
+fn basename(env: &mut Environment, path: ConstPtr<u8>) -> MutPtr<u8> {
+    const MAXPATHLEN: GuestUSize = 1024;
+    let path = if path.is_null() {
+        &b""[..]
+    } else {
+        env.mem.cstr_at(path)
+    };
+    let trimmed = &path[..path.iter().rposition(|&c| c != b'/').map_or(0, |i| i + 1)];
+    let result = if path.is_empty() {
+        b".".to_vec()
+    } else if trimmed.is_empty() {
+        b"/".to_vec()
+    } else {
+        let start = trimmed
+            .iter()
+            .rposition(|&c| c == b'/')
+            .map_or(0, |i| i + 1);
+        trimmed[start..].to_vec()
+    };
+    if result.len() as GuestUSize >= MAXPATHLEN {
+        set_errno(env, ENAMETOOLONG);
+        return Ptr::null();
+    }
+    let buf = *env
+        .libc_state
+        .stdlib
+        .basename_buf
+        .get_or_insert_with(|| env.mem.alloc(MAXPATHLEN).cast());
+    let len = result.len() as GuestUSize;
+    env.mem.bytes_at_mut(buf, len).copy_from_slice(&result);
+    env.mem.write(buf + len, b'\0');
+    buf
+}
+
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(malloc(_)),
     export_c_func!(malloc_size(_)),
@@ -692,6 +801,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(wcstoul(_, _, _)),
     export_c_func!(strtoull(_, _, _)),
     export_c_func!(strtol(_, _, _)),
+    export_c_func!(strtoll(_, _, _)),
     export_c_func!(wcstol(_, _, _)),
     export_c_func!(realpath(_, _)),
     export_c_func_aliased!("realpath$DARWIN_EXTSN", realpath(_, _)),
@@ -699,6 +809,8 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(wcstombs(_, _, _)),
     export_c_func!(system(_)),
     export_c_func!(fcvt(_, _, _, _)),
+    export_c_func!(mktemp(_)),
+    export_c_func!(basename(_)),
 ];
 
 /// A simple wrapper around [atof_inner_generic] for the case of C string.

@@ -7,7 +7,7 @@
 version = "0.3.0"
 edition = "2021"
 license = "MPL-2.0"
-authors = ["touchHLE project contributors"]
+authors = ["iDared 32bit project contributors", "touchHLE project contributors"]
 homepage = "http://iDared32bit-emu.com/"
 
 [package]
@@ -63,6 +63,7 @@ md-5 = "0.10.6"
 sha1 = "0.10.6"
 sha2 = { version = "0.10.6", features = ["compress"] }
 encoding_rs = "0.8.35"
+tiny-skia = { version = "0.11.4", default-features = false, features = ["std"] }
 # We currently use a fork of rust-sdl2 because we need a fix for Android builds
 # that's not upstream yet.
 # The HIDAPI feature is enabled because rust-sdl2 hides the SDL2 sensor features
@@ -84,6 +85,10 @@ nibarchive = "0.1.0"
 libc = "0.2.180"
 corosensei = "0.3.2"
 uuid = { version = "1.2.2", default-features = false, features = ["v4"] }
+ecb = { version = "0.1.2", features = ["alloc"] }
+aes = "0.8.4"
+hmac = "0.12.1"
+cbc = { version = "0.1.2", features = ["alloc"] }
 
 [patch.crates-io]
 cmake = { git = 'https://github.com/iDared32bit-emu/cmake-rs', branch = "fix-iphone-build" }

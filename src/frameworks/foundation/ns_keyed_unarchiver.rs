@@ -83,6 +83,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 // TODO: other init methods.
 
+- (bool)allowsKeyedCoding {
+    true
+}
+
 - (id)initForReadingWithData:(id)data { // NSData *
     if data == nil {
         return nil;
@@ -152,7 +156,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (f64)decodeDoubleForKey:(id)key { // NSString *
     get_value_to_decode_for_key(env, this, key).map_or(
         0.0,
-        |value| value.as_real().unwrap()
+        decode_number,
     )
 }
 
@@ -160,7 +164,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     // TODO: Check bounds, raise NSRangeException if it doesn't fit
     get_value_to_decode_for_key(env, this, key).map_or(
         0.0,
-        |value| value.as_real().unwrap()
+        decode_number,
     ) as f32
 }
 
@@ -394,6 +398,15 @@ pub fn decode_current_dict(env: &mut Environment, unarchiver: id) -> Vec<(id, id
     keys.into_iter().zip(vals).collect()
 }
 
+/// Like iOS, any number will do: whole ones may be stored as integers.
+fn decode_number(value: &Value) -> f64 {
+    value
+        .as_real()
+        .or_else(|| value.as_signed_integer().map(|i| i as f64))
+        .or_else(|| value.as_unsigned_integer().map(|i| i as f64))
+        .unwrap_or_else(|| panic!("Can't decode {value:?} as a number"))
+}
+
 /// Shortcut for use by `[NSDate initWithCoder:]`.
 pub fn decode_current_date(env: &mut Environment, unarchiver: id) -> id {
     let key = get_static_str(env, "NS.time");
@@ -429,6 +442,15 @@ pub fn decode_current_data(env: &mut Environment, unarchiver: id, is_mutable: bo
 /// Shortcut for use by `[NSString initWithCoder:]`.
 /// TODO: mutability
 pub fn decode_current_string(env: &mut Environment, unarchiver: id) -> id {
+    // Mutable strings are archived as a string, rather than as bytes.
+    let key = get_static_str(env, "NS.string");
+    let string = get_value_to_decode_for_key(env, unarchiver, key)
+        .and_then(|value| value.as_string())
+        .map(|string| string.to_string());
+    if let Some(string) = string {
+        return from_rust_string(env, string);
+    }
+
     let key = get_static_str(env, "NS.bytes");
     // TODO: avoid copying (twice!)
     let bytes = get_value_to_decode_for_key(env, unarchiver, key)

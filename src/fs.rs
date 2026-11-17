@@ -29,6 +29,7 @@ mod bundle;
 pub use bundle::BundleData;
 
 use crate::fs::bundle::{IpaFile, IpaFileRef};
+use crate::libc::posix_io::pipe::PipeEnd;
 use crate::paths;
 use std::collections::HashMap;
 use std::fs;
@@ -381,6 +382,7 @@ pub enum GuestFile {
     IpaBundleFile(IpaFile),
     ResourceFile(paths::ResourceFile),
     Socket,
+    Pipe(PipeEnd),
 }
 
 impl GuestFile {
@@ -402,6 +404,18 @@ impl GuestFile {
 
     pub fn sync_all(&self) -> std::io::Result<()> {
         match self {
+            // A plain fsync(), as on iOS. On Apple platforms, Rust's
+            // sync_all() also flushes the drive's cache (F_FULLFSYNC), which
+            // is far slower, and games such as those using SQLite sync often.
+            #[cfg(unix)]
+            GuestFile::File(file) => {
+                use std::os::fd::AsRawFd;
+                match unsafe { libc::fsync(file.as_raw_fd()) } {
+                    0 => Ok(()),
+                    _ => Err(std::io::Error::last_os_error()),
+                }
+            }
+            #[cfg(not(unix))]
             GuestFile::File(file) => file.sync_all(),
             GuestFile::IpaBundleFile(_) | GuestFile::ResourceFile(_) => Ok(()),
             GuestFile::Directory => {
@@ -412,6 +426,7 @@ impl GuestFile {
                 std::io::ErrorKind::Unsupported,
                 "Sync operation not supported on socket",
             )),
+            GuestFile::Pipe(_) => Ok(()),
         }
     }
     pub fn set_len(&self, len: u64) -> std::io::Result<()> {
@@ -439,7 +454,7 @@ impl GuestFile {
     pub fn is_seekable(&self) -> bool {
         // Due to legacy directory iteration support, directories are seekable
         // https://stackoverflow.com/questions/65911066/what-does-lseek-mean-for-a-directory-file-descriptor
-        !matches!(self, GuestFile::Socket)
+        !matches!(self, GuestFile::Socket | GuestFile::Pipe(_))
     }
 }
 
@@ -453,6 +468,7 @@ impl Read for GuestFile {
                 std::io::ErrorKind::IsADirectory,
                 "Attempt to read from a directory as a guest file",
             )),
+            GuestFile::Pipe(pipe) => pipe.read(buf),
             _ => unimplemented!(),
         }
     }
@@ -469,6 +485,7 @@ impl Write for GuestFile {
                 panic!("Attempt to write to a read-only file: {file:?}")
             }
             GuestFile::Directory => panic!("Attempt to write to a directory as a guest file"),
+            GuestFile::Pipe(pipe) => pipe.write(buf),
             _ => unimplemented!(),
         }
     }
@@ -484,6 +501,7 @@ impl Write for GuestFile {
                 panic!("Attempt to flush a read-only file: {file:?}")
             }
             GuestFile::Directory => panic!("Attempt to flush a directory as a guest file"),
+            GuestFile::Pipe(_) => Ok(()),
             _ => unimplemented!(),
         }
     }
@@ -518,6 +536,50 @@ pub struct Fs {
     working_directory: GuestPathBuf,
     home_directory: GuestPathBuf,
 }
+fn host_modified(path: &Path) -> Result<i64, ()> {
+    // TODO: account for the current timezone, here it's in GMT
+    fs::metadata(path)
+        .and_then(|m| m.modified())
+        .map(|t| {
+            t.duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                .try_into()
+                .unwrap()
+        })
+        .map_err(|_| ())
+}
+
+fn node_modified(node: &FsNode) -> Result<i64, ()> {
+    match node {
+        FsNode::File { location, .. } => match location {
+            // Note: the returned time is consistent with 'Date' and 'Time'
+            // of files inside IPA archive as reported by 7-zip.
+            // But it can be few hours off in comparison with modification
+            // time reported by NSFileModificationDate for app bundle files
+            // and changes if system timezone changes and apps gets
+            // re-installed!
+            // This shouldn't be a big problem as we're always assuming
+            // GMT in the codebase right now.
+            // TODO: double check that when we support different timezones
+            FileLocation::IpaFileRef(ipa_file_ref) => Ok(ipa_file_ref.get_last_modified().into()),
+            FileLocation::Path(path) => host_modified(path),
+            _ => unimplemented!(),
+        },
+        FsNode::Directory {
+            writeable: Some(host_path),
+            ..
+        } => host_modified(host_path),
+        // A bundle directory has no host directory behind it. A directory's
+        // time changes when its entries do, so use the newest of those.
+        FsNode::Directory { children, .. } => Ok(children
+            .values()
+            .filter_map(|child| node_modified(child).ok())
+            .max()
+            .unwrap_or(0)),
+    }
+}
+
 impl Fs {
     /// Construct a filesystem containing a home directory for the app, its
     /// bundle and documents, and the bundled shared libraries. Returns the new
@@ -828,37 +890,7 @@ impl Fs {
     pub fn modified(&self, path: &GuestPath) -> Result<i64, ()> {
         // TODO: error handling
         let node = self.lookup_node(path).ok_or(())?;
-        match node {
-            FsNode::File { location, .. } => match location {
-                // Note: the returned time is consistent with 'Date' and 'Time'
-                // of files inside IPA archive as reported by 7-zip.
-                // But it can be few hours off in comparison with modification
-                // time reported by NSFileModificationDate for app bundle files
-                // and changes if system timezone changes and apps gets
-                // re-installed!
-                // This shouldn't be a big problem as we're always assuming
-                // GMT in the codebase right now.
-                // TODO: double check that when we support different timezones
-                FileLocation::IpaFileRef(ipa_file_ref) => {
-                    Ok(ipa_file_ref.get_last_modified().into())
-                }
-                FileLocation::Path(path) => {
-                    // TODO: account for the current timezone, here it's in GMT
-                    fs::metadata(path)
-                        .and_then(|m| m.modified())
-                        .map(|t| {
-                            t.duration_since(UNIX_EPOCH)
-                                .unwrap()
-                                .as_secs()
-                                .try_into()
-                                .unwrap()
-                        })
-                        .map_err(|_| ())
-                }
-                _ => unimplemented!(),
-            },
-            _ => unimplemented!(),
-        }
+        node_modified(node)
     }
 
     pub fn size(&self, path: &GuestPath) -> Result<u64, ()> {
@@ -872,7 +904,8 @@ impl Fs {
                 }
                 _ => unimplemented!(),
             },
-            _ => unimplemented!(),
+            // As HFS+ reports it: 34 bytes per entry, counting . and ..
+            FsNode::Directory { children, .. } => Ok((children.len() as u64 + 2) * 34),
         }
     }
 
@@ -904,42 +937,6 @@ impl Fs {
                 },
             )
         }))
-    }
-
-    /// Recursively list the paths of files/directories in a directory.
-    /// The base path (`path`) is not included in the returned paths.
-    pub fn enumerate_recursive<P: AsRef<GuestPath>>(
-        &self,
-        path: P,
-    ) -> Result<Vec<GuestPathBuf>, ()> {
-        let Some(FsNode::Directory { children, .. }) = self.lookup_node(path.as_ref()) else {
-            return Err(());
-        };
-
-        let mut paths = Vec::new();
-        let mut component_stack: Vec<&str> = Vec::new();
-        let mut iterator_stack = vec![children.iter()];
-
-        loop {
-            let current_iterator = iterator_stack.last_mut().unwrap();
-            if let Some((next_component, next_node)) = current_iterator.next() {
-                component_stack.push(next_component);
-                paths.push(GuestPathBuf::from(component_stack.join("/")));
-                if let FsNode::Directory { children, .. } = next_node {
-                    iterator_stack.push(children.iter());
-                } else {
-                    component_stack.pop();
-                }
-            } else {
-                iterator_stack.pop();
-                if component_stack.pop().is_none() {
-                    break;
-                }
-            }
-        }
-        assert!(component_stack.is_empty() && iterator_stack.is_empty());
-
-        Ok(paths)
     }
 
     /// Like [std::fs::read] but for the guest filesystem.

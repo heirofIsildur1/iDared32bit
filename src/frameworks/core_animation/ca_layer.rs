@@ -6,6 +6,7 @@
 //! `CALayer`.
 
 use crate::dyld::{ConstantExports, HostConstant};
+use crate::frameworks::core_animation::ca_animation::get_transition;
 use crate::frameworks::core_animation::ca_transaction;
 use crate::frameworks::core_animation::ca_transform_3d::CATransform3D;
 use crate::frameworks::core_foundation::time::CFTimeInterval;
@@ -49,6 +50,7 @@ pub(super) struct CALayerHostObject {
     pub(super) hidden: bool,
     pub(super) opaque: bool,
     pub(super) opacity: f32,
+    pub(super) z_position: CGFloat,
     pub(super) background_color: Option<CGColorHostObject>,
     pub(super) corner_radius: CGFloat,
     pub(super) needs_display: bool,
@@ -67,8 +69,88 @@ pub(super) struct CALayerHostObject {
     pub(super) gles_texture: Option<crate::gles::gles11_raw::types::GLuint>,
     /// Internal state for compositor
     pub(super) gles_texture_is_up_to_date: bool,
+    /// Internal state for compositor: the `contents` the texture was made
+    /// from, which an animation can change without `setContents:`.
+    pub(super) gles_texture_contents: id,
     pub(super) animations: HashMap<String, id>, // CAAnimation*
     pub(super) anonymous_animations: HashSet<id>, // CAAnimation*
+    /// Presentation layer only: a fade transition and how far it's gone (0
+    /// to 1), for the compositor.
+    pub(super) fade_transition: Option<(id, f32)>,
+    /// Where `contents` goes in the bounds.
+    pub(super) contents_gravity: ContentsGravity,
+    /// Whether the contents and sublayers are clipped to the bounds.
+    pub(super) masks_to_bounds: bool,
+}
+
+/// Where a layer's `contents` go in its bounds. This is set from a view's
+/// `contentMode`, so `Top` and so on mean the top as seen on screen.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ContentsGravity {
+    Resize,
+    ResizeAspect,
+    ResizeAspectFill,
+    Center,
+    Top,
+    Bottom,
+    Left,
+    Right,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+impl ContentsGravity {
+    /// Where contents of `size` go in `bounds`. They aren't clipped.
+    pub(super) fn rect(self, bounds: CGRect, size: CGSize) -> CGRect {
+        use ContentsGravity::*;
+        let size = match self {
+            Resize => return bounds,
+            ResizeAspect | ResizeAspectFill => {
+                let (sx, sy) = (
+                    bounds.size.width / size.width,
+                    bounds.size.height / size.height,
+                );
+                let scale = if self == ResizeAspect {
+                    sx.min(sy)
+                } else {
+                    sx.max(sy)
+                };
+                CGSize {
+                    width: size.width * scale,
+                    height: size.height * scale,
+                }
+            }
+            _ => size,
+        };
+        // How far across and down: 0 is left or top, 1 is right or bottom.
+        let (fx, fy) = match self {
+            Top => (0.5, 0.0),
+            Bottom => (0.5, 1.0),
+            Left => (0.0, 0.5),
+            Right => (1.0, 0.5),
+            TopLeft => (0.0, 0.0),
+            TopRight => (1.0, 0.0),
+            BottomLeft => (0.0, 1.0),
+            BottomRight => (1.0, 1.0),
+            _ => (0.5, 0.5),
+        };
+        CGRect {
+            origin: CGPoint {
+                x: bounds.origin.x + ((bounds.size.width - size.width) * fx).round(),
+                y: bounds.origin.y + ((bounds.size.height - size.height) * fy).round(),
+            },
+            size,
+        }
+    }
+}
+
+/// For `UIView`'s `contentMode`.
+pub fn set_contents_gravity(env: &mut Environment, layer: id, gravity: ContentsGravity) {
+    env.objc
+        .borrow_mut::<CALayerHostObject>(layer)
+        .contents_gravity = gravity;
 }
 impl HostObject for CALayerHostObject {}
 
@@ -129,6 +211,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         hidden: false,
         opaque: false,
         opacity: 1.0,
+        z_position: 0.0,
         background_color: None, // transparency
         corner_radius: 0.0,
         needs_display: false,
@@ -143,8 +226,12 @@ pub const CLASSES: ClassExports = objc_classes! {
         cg_context: None,
         gles_texture: None,
         gles_texture_is_up_to_date: false,
+        gles_texture_contents: nil,
         animations: HashMap::new(),
         anonymous_animations: HashSet::new(),
+        fade_transition: None,
+        contents_gravity: ContentsGravity::Resize,
+        masks_to_bounds: false,
     });
     env.objc.alloc_object(this, host_object, &mut env.mem)
 }
@@ -360,11 +447,25 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
 }
 
+- (bool)masksToBounds {
+    env.objc.borrow::<CALayerHostObject>(this).masks_to_bounds
+}
+- (())setMasksToBounds:(bool)masks {
+    env.objc.borrow_mut::<CALayerHostObject>(this).masks_to_bounds = masks;
+}
+
 - (bool)isOpaque {
     env.objc.borrow::<CALayerHostObject>(this).opaque
 }
 - (())setOpaque:(bool)opaque {
     env.objc.borrow_mut::<CALayerHostObject>(this).opaque = opaque;
+}
+
+- (CGFloat)zPosition {
+    env.objc.borrow::<CALayerHostObject>(this).z_position
+}
+- (())setZPosition:(CGFloat)z_position {
+    env.objc.borrow_mut::<CALayerHostObject>(this).z_position = z_position;
 }
 
 - (f32)opacity {
@@ -608,6 +709,12 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())addAnimation:(id)anim // CAAnimation*
             forKey:(id)key { // NSString*
+    // Like Core Animation, keep a copy, so the app can reuse the original.
+    let anim: id = msg![env; anim copy];
+    if get_transition(env, anim).is_some() {
+        // The compositor keeps a picture of the layer from before.
+        super::composition::add_transition(env, this, anim);
+    }
     let duration: CFTimeInterval = msg![env; anim duration];
     if duration == 0.0 {
         // From the docs:
@@ -626,9 +733,18 @@ pub const CLASSES: ClassExports = objc_classes! {
     } else {
         let key_string = to_rust_string(env, key);
         log_dbg!("[(CALayer*){:?} addAnimation:{:?} forKey:{:?} ({:?})]", this, anim, key, key_string);
-        env.objc.borrow_mut::<CALayerHostObject>(this).animations.insert(key_string.to_string(), anim);
+        let host_obj = env.objc.borrow_mut::<CALayerHostObject>(this);
+        // An animation with the same key replaces the old one.
+        if let Some(old) = host_obj.animations.insert(key_string.to_string(), anim) {
+            release(env, old);
+        }
     }
-    retain(env, anim);
+}
+
+- (id)animationForKey:(id)key { // NSString*
+    let key_string = to_rust_string(env, key);
+    let host_obj = env.objc.borrow::<CALayerHostObject>(this);
+    host_obj.animations.get(&*key_string).copied().unwrap_or(nil)
 }
 
 - (())removeAnimationForKey:(id)key { // NSString*

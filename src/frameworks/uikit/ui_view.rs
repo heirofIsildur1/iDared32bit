@@ -12,9 +12,11 @@ pub mod ui_alert_view;
 pub mod ui_control;
 pub mod ui_image_view;
 pub mod ui_label;
+pub mod ui_navigation_bar;
 pub mod ui_page_control;
 pub mod ui_picker_view;
 pub mod ui_scroll_view;
+pub mod ui_table_view_cell;
 pub mod ui_toolbar;
 pub mod ui_web_view;
 pub mod ui_window;
@@ -25,6 +27,7 @@ use super::ui_graphics::{UIGraphicsPopContext, UIGraphicsPushContext};
 use crate::frameworks::core_animation::ca_animation::{
     kCAFillModeBackwards, CAMediaTimingFillMode,
 };
+use crate::frameworks::core_animation::ca_layer::{set_contents_gravity, ContentsGravity};
 use crate::frameworks::core_animation::ca_media_timing_function::{
     kCAMediaTimingFunctionEaseIn, kCAMediaTimingFunctionEaseInEaseOut,
     kCAMediaTimingFunctionEaseOut, kCAMediaTimingFunctionLinear,
@@ -90,8 +93,46 @@ pub struct UIViewHostObject {
     clears_context_before_drawing: bool,
     user_interaction_enabled: bool,
     multiple_touch_enabled: bool,
+    /// Whether `layoutSubviews` should be called before the next frame.
+    needs_layout: bool,
+    autoresizing_mask: UIViewAutoresizing,
+    autoresizes_subviews: bool,
+    content_mode: UIViewContentMode,
 }
 impl HostObject for UIViewHostObject {}
+
+type UIViewAutoresizing = NSUInteger;
+const UIViewAutoresizingNone: UIViewAutoresizing = 0;
+const UIViewAutoresizingFlexibleLeftMargin: UIViewAutoresizing = 1 << 0;
+const UIViewAutoresizingFlexibleWidth: UIViewAutoresizing = 1 << 1;
+const UIViewAutoresizingFlexibleRightMargin: UIViewAutoresizing = 1 << 2;
+const UIViewAutoresizingFlexibleTopMargin: UIViewAutoresizing = 1 << 3;
+const UIViewAutoresizingFlexibleHeight: UIViewAutoresizing = 1 << 4;
+const UIViewAutoresizingFlexibleBottomMargin: UIViewAutoresizing = 1 << 5;
+
+type UIViewContentMode = NSInteger;
+const UIViewContentModeScaleToFill: UIViewContentMode = 0;
+const UIViewContentModeRedraw: UIViewContentMode = 3;
+
+/// How a content mode places a layer's contents.
+fn contents_gravity(mode: UIViewContentMode) -> ContentsGravity {
+    match mode {
+        1 => ContentsGravity::ResizeAspect,
+        2 => ContentsGravity::ResizeAspectFill,
+        4 => ContentsGravity::Center,
+        5 => ContentsGravity::Top,
+        6 => ContentsGravity::Bottom,
+        7 => ContentsGravity::Left,
+        8 => ContentsGravity::Right,
+        9 => ContentsGravity::TopLeft,
+        10 => ContentsGravity::TopRight,
+        11 => ContentsGravity::BottomLeft,
+        12 => ContentsGravity::BottomRight,
+        // Scale to fill and redraw.
+        _ => ContentsGravity::Resize,
+    }
+}
+
 impl Default for UIViewHostObject {
     fn default() -> UIViewHostObject {
         // The Default trait is implemented so subclasses will get the same
@@ -105,6 +146,10 @@ impl Default for UIViewHostObject {
             clears_context_before_drawing: true,
             user_interaction_enabled: true,
             multiple_touch_enabled: false,
+            needs_layout: true,
+            autoresizing_mask: UIViewAutoresizingNone,
+            autoresizes_subviews: true,
+            content_mode: UIViewContentModeScaleToFill,
         }
     }
 }
@@ -127,6 +172,15 @@ pub fn set_view_controller(env: &mut Environment, view: id, controller: id) {
     host_obj.view_controller = controller;
 }
 
+/// Lay out the views in the windows that need it, as UIKit does before
+/// drawing each frame.
+pub fn layout_if_needed(env: &mut Environment) {
+    let windows = env.framework_state.uikit.ui_view.ui_window.windows.clone();
+    for window in windows {
+        () = msg![env; window layoutIfNeeded];
+    }
+}
+
 /// Shared parts of `initWithCoder:` and `initWithFrame:`. These can't call
 /// `init`: the subclass may have overridden `init` and will not expect to be
 /// called here.
@@ -146,6 +200,24 @@ fn init_common(env: &mut Environment, this: id) -> id {
     env.framework_state.uikit.ui_view.views.push(this);
 
     this
+}
+
+/// The selector set for a UIView animation, or else `default` if the
+/// delegate implements it.
+fn animation_selector(
+    env: &mut Environment,
+    delegate: id,
+    key: &'static str,
+    default: &str,
+) -> Option<SEL> {
+    let selector: id = msg_class![env; CATransaction valueForKey:(get_static_str(env, key))];
+    if selector != nil {
+        let selector = to_rust_string(env, selector);
+        return Some(env.objc.lookup_selector(&selector).unwrap());
+    }
+    let selector = env.objc.lookup_selector(default)?;
+    let responds: bool = msg![env; delegate respondsToSelector:selector];
+    responds.then_some(selector)
 }
 
 pub const CLASSES: ClassExports = objc_classes! {
@@ -281,16 +353,24 @@ pub const CLASSES: ClassExports = objc_classes! {
                 let context: ConstVoidPtr = ConstVoidPtr::from_bits(context as GuestUSize);
                 () = msg![env; animation_delegate setContext:context];
             }
-            let will_start_selector: id = msg_class![env; CATransaction valueForKey:(get_static_str(env, touchHLE_kCATransactionAnimationWillStartSelector))];
-            if will_start_selector != nil {
-                let will_start_selector = to_rust_string(env, will_start_selector);
-                let will_start_selector = env.objc.lookup_selector(&will_start_selector).unwrap();
+            // Like iPhone OS, use these selectors by default if the delegate
+            // implements them. Old games rely on that.
+            let will_start_selector = animation_selector(
+                env,
+                delegate,
+                touchHLE_kCATransactionAnimationWillStartSelector,
+                "animationWillStart:context:",
+            );
+            if let Some(will_start_selector) = will_start_selector {
                 () = msg![env; animation_delegate setWillStartSelector:will_start_selector];
             }
-            let did_stop_selector: id = msg_class![env; CATransaction valueForKey:(get_static_str(env, touchHLE_kCATransactionAnimationDidStopSelector))];
-            if did_stop_selector != nil {
-                let did_stop_selector = to_rust_string(env, did_stop_selector);
-                let did_stop_selector = env.objc.lookup_selector(&did_stop_selector).unwrap();
+            let did_stop_selector = animation_selector(
+                env,
+                delegate,
+                touchHLE_kCATransactionAnimationDidStopSelector,
+                "animationDidStop:finished:context:",
+            );
+            if let Some(did_stop_selector) = did_stop_selector {
                 () = msg![env; animation_delegate setDidStopSelector:did_stop_selector];
             }
             let total_animation_count = animations.len() as u32;
@@ -370,6 +450,13 @@ pub const CLASSES: ClassExports = objc_classes! {
     let key_ns_string = get_static_str(env, "UIOpaque");
     let opaque: bool = msg![env; coder decodeBoolForKey:key_ns_string];
 
+    let key_ns_string = get_static_str(env, "UIAlpha");
+    let alpha: CGFloat = if msg![env; coder containsValueForKey:key_ns_string] {
+        msg![env; coder decodeFloatForKey:key_ns_string]
+    } else {
+        1.0
+    };
+
     let key_ns_string = get_static_str(env, "UIBackgroundColor");
     let bg_color: id = msg![env; coder decodeObjectForKey:key_ns_string];
 
@@ -381,6 +468,20 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     let key_ns_string = get_static_str(env, "UIUserInteractionDisabled");
     let user_interaction_disabled: bool = msg![env; coder decodeBoolForKey:key_ns_string];
+
+    let key_ns_string = get_static_str(env, "UIClipsToBounds");
+    let clips_to_bounds: bool = msg![env; coder decodeBoolForKey:key_ns_string];
+
+    let key_ns_string = get_static_str(env, "UIContentMode");
+    let content_mode: NSInteger = msg![env; coder decodeIntegerForKey:key_ns_string];
+
+    let key_ns_string = get_static_str(env, "UIAutoresizingMask");
+    let autoresizing_mask: NSInteger = msg![env; coder decodeIntegerForKey:key_ns_string];
+    let autoresizing_mask = autoresizing_mask as UIViewAutoresizing;
+
+    // Nibs only have this when it's on.
+    let key_ns_string = get_static_str(env, "UIAutoresizeSubviews");
+    let autoresizes_subviews: bool = msg![env; coder decodeBoolForKey:key_ns_string];
 
     let key_ns_string = get_static_str(env, "UISubviews");
     let subviews: id = msg![env; coder decodeObjectForKey:key_ns_string];
@@ -404,10 +505,15 @@ pub const CLASSES: ClassExports = objc_classes! {
     () = msg![env; this setCenter:center];
     () = msg![env; this setHidden:hidden];
     () = msg![env; this setOpaque:opaque];
+    () = msg![env; this setAlpha:alpha];
     () = msg![env; this setBackgroundColor:bg_color];
     () = msg![env; this setTag:tag];
     () = msg![env; this setMultipleTouchEnabled:multi_touch_enabled];
     () = msg![env; this setUserInteractionEnabled:(!user_interaction_disabled)];
+    () = msg![env; this setAutoresizingMask:autoresizing_mask];
+    () = msg![env; this setContentMode:content_mode];
+    () = msg![env; this setClipsToBounds:clips_to_bounds];
+    () = msg![env; this setAutoresizesSubviews:autoresizes_subviews];
 
     for i in 0..subview_count {
         let subview: id = msg![env; subviews objectAtIndex:i];
@@ -464,8 +570,40 @@ pub const CLASSES: ClassExports = objc_classes! {
     // nothing.
 }
 
+- (())setNeedsLayout {
+    env.objc.borrow_mut::<UIViewHostObject>(this).needs_layout = true;
+}
+
+- (())layoutIfNeeded {
+    let host_obj = env.objc.borrow_mut::<UIViewHostObject>(this);
+    if std::mem::take(&mut host_obj.needs_layout) {
+        () = msg![env; this layoutSubviews];
+    }
+    let subviews = env.objc.borrow::<UIViewHostObject>(this).subviews.clone();
+    // Laying out one could remove another.
+    for &subview in &subviews {
+        retain(env, subview);
+    }
+    for subview in subviews {
+        () = msg![env; subview layoutIfNeeded];
+        release(env, subview);
+    }
+}
+
 - (id)superview {
     env.objc.borrow::<UIViewHostObject>(this).superview
+}
+
+// A view counts as a descendant of itself, as in UIKit.
+- (bool)isDescendantOfView:(id)view {
+    let mut current = this;
+    while current != nil {
+        if current == view {
+            return true;
+        }
+        current = env.objc.borrow::<UIViewHostObject>(current).superview;
+    }
+    false
 }
 
 - (id)window {
@@ -515,6 +653,8 @@ pub const CLASSES: ClassExports = objc_classes! {
         let this_layer = this_obj.layer;
         () = msg![env; this_layer addSublayer:subview_layer];
     }
+    () = msg![env; this setNeedsLayout];
+    () = msg![env; view setNeedsLayout];
 }
 
 - (())insertSubview:(id)view atIndex:(NSInteger)index {
@@ -536,6 +676,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     assert!(index >= 0);
     () = msg![env; this_layer insertSublayer:subview_layer atIndex:(index as u32)];
+    () = msg![env; this setNeedsLayout];
+    () = msg![env; view setNeedsLayout];
 }
 
 - (())insertSubview:(id)view belowSubview:(id)sibling {
@@ -558,6 +700,8 @@ pub const CLASSES: ClassExports = objc_classes! {
     subviews.insert(idx, view);
 
     () = msg![env; this_layer insertSublayer:subview_layer below:sibling_layer];
+    () = msg![env; this setNeedsLayout];
+    () = msg![env; view setNeedsLayout];
 }
 
 - (())bringSubviewToFront:(id)subview {
@@ -641,6 +785,10 @@ pub const CLASSES: ClassExports = objc_classes! {
         clears_context_before_drawing: _,
         user_interaction_enabled: _,
         multiple_touch_enabled: _,
+        needs_layout: _,
+        autoresizing_mask: _,
+        autoresizes_subviews: _,
+        content_mode: _,
     } = std::mem::take(env.objc.borrow_mut(this));
 
     release(env, layer);
@@ -672,8 +820,17 @@ pub const CLASSES: ClassExports = objc_classes! {
     msg![env; layer setHidden:hidden]
 }
 
+// The layer does the clipping.
+- (bool)clipsToBounds {
+    let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
+    msg![env; layer masksToBounds]
+}
+- (bool)isClipsToBounds {
+    msg![env; this clipsToBounds]
+}
 - (())setClipsToBounds:(bool)clips {
-    todo_objc_setter!(this, clips);
+    let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
+    () = msg![env; layer setMasksToBounds:clips];
 }
 
 - (bool)isOpaque {
@@ -740,7 +897,12 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 - (())setBounds:(CGRect)bounds {
     let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
-    msg![env; layer setBounds:bounds]
+    let old: CGRect = msg![env; layer bounds];
+    () = msg![env; layer setBounds:bounds];
+    if old.size != bounds.size {
+        autoresize_subviews(env, this, old.size, bounds.size);
+        () = msg![env; this setNeedsLayout];
+    }
 }
 - (CGPoint)center {
     // FIXME: what happens if [layer anchorPoint] isn't (0.5, 0.5)?
@@ -757,7 +919,13 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 - (())setFrame:(CGRect)frame {
     let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
-    msg![env; layer setFrame:frame]
+    let old: CGRect = msg![env; layer bounds];
+    () = msg![env; layer setFrame:frame];
+    let new: CGRect = msg![env; layer bounds];
+    if old.size != new.size {
+        autoresize_subviews(env, this, old.size, new.size);
+        () = msg![env; this setNeedsLayout];
+    }
 }
 - (CGAffineTransform)transform {
     let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
@@ -768,8 +936,15 @@ pub const CLASSES: ClassExports = objc_classes! {
     msg![env; layer setAffineTransform:transform]
 }
 
-- (())setContentMode:(NSInteger)content_mode { // should be UIViewContentMode
-    todo_objc_setter!(this, content_mode);
+- (UIViewContentMode)contentMode {
+    env.objc.borrow::<UIViewHostObject>(this).content_mode
+}
+- (())setContentMode:(UIViewContentMode)content_mode {
+    env.objc.borrow_mut::<UIViewHostObject>(this).content_mode = content_mode;
+    let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
+    set_contents_gravity(env, layer, contents_gravity(content_mode));
+    let redraw = content_mode == UIViewContentModeRedraw;
+    () = msg![env; layer setNeedsDisplayOnBoundsChange:redraw];
 }
 
 - (bool)clearsContextBeforeDrawing {
@@ -908,11 +1083,17 @@ pub const CLASSES: ClassExports = objc_classes! {
     msg![env; this_layer convertRect:rect toLayer:other_layer]
 }
 
-- (())setAutoresizingMask:(NSUInteger)mask {
-    todo_objc_setter!(this, mask);
+- (UIViewAutoresizing)autoresizingMask {
+    env.objc.borrow::<UIViewHostObject>(this).autoresizing_mask
+}
+- (())setAutoresizingMask:(UIViewAutoresizing)mask {
+    env.objc.borrow_mut::<UIViewHostObject>(this).autoresizing_mask = mask;
+}
+- (bool)autoresizesSubviews {
+    env.objc.borrow::<UIViewHostObject>(this).autoresizes_subviews
 }
 - (())setAutoresizesSubviews:(bool)enabled {
-    todo_objc_setter!(this, enabled);
+    env.objc.borrow_mut::<UIViewHostObject>(this).autoresizes_subviews = enabled;
 }
 
 - (CGSize)sizeThatFits:(CGSize)size {
@@ -1033,3 +1214,83 @@ pub const CLASSES: ClassExports = objc_classes! {
 @end
 
 };
+
+/// When a view changes size, its subviews' flexible margins and sizes take up
+/// the difference, shared in proportion to their current sizes (as Apple's
+/// `UIViewAutoresizing` documentation describes).
+fn autoresize_subviews(env: &mut Environment, this: id, old: CGSize, new: CGSize) {
+    if !env
+        .objc
+        .borrow::<UIViewHostObject>(this)
+        .autoresizes_subviews
+    {
+        return;
+    }
+    let subviews = env.objc.borrow::<UIViewHostObject>(this).subviews.clone();
+    for subview in subviews {
+        let mask = env
+            .objc
+            .borrow::<UIViewHostObject>(subview)
+            .autoresizing_mask;
+        if mask == UIViewAutoresizingNone {
+            continue;
+        }
+        let mut frame: CGRect = msg![env; subview frame];
+        let (x, width) = autoresize_axis(
+            frame.origin.x,
+            frame.size.width,
+            old.width,
+            new.width,
+            [
+                mask & UIViewAutoresizingFlexibleLeftMargin != 0,
+                mask & UIViewAutoresizingFlexibleWidth != 0,
+                mask & UIViewAutoresizingFlexibleRightMargin != 0,
+            ],
+        );
+        let (y, height) = autoresize_axis(
+            frame.origin.y,
+            frame.size.height,
+            old.height,
+            new.height,
+            [
+                mask & UIViewAutoresizingFlexibleTopMargin != 0,
+                mask & UIViewAutoresizingFlexibleHeight != 0,
+                mask & UIViewAutoresizingFlexibleBottomMargin != 0,
+            ],
+        );
+        frame.origin.x = x;
+        frame.size.width = width;
+        frame.origin.y = y;
+        frame.size.height = height;
+        () = msg![env; subview setFrame:frame];
+    }
+}
+
+/// One axis of [autoresize_subviews]: the new position and size, given which
+/// of the leading margin, size and trailing margin are flexible.
+fn autoresize_axis(
+    pos: CGFloat,
+    size: CGFloat,
+    old: CGFloat,
+    new: CGFloat,
+    flexible: [bool; 3],
+) -> (CGFloat, CGFloat) {
+    let parts = [pos, size, old - pos - size];
+    let flexible_total: CGFloat = (0..3).filter(|&i| flexible[i]).map(|i| parts[i]).sum();
+    let flexible_count = flexible.iter().filter(|&&f| f).count();
+    if flexible_count == 0 {
+        return (pos, size);
+    }
+    let delta = new - old;
+    // Each flexible part's share of the difference.
+    let share = |i: usize| -> CGFloat {
+        if !flexible[i] {
+            0.0
+        } else if flexible_total > 0.0 {
+            delta * parts[i] / flexible_total
+        } else {
+            delta / flexible_count as CGFloat
+        }
+    };
+    (pos + share(0), (size + share(1)).max(0.0))
+}

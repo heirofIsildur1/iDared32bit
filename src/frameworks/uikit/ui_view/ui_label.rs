@@ -33,6 +33,11 @@ pub struct UILabelHostObject {
     text_alignment: UITextAlignment,
     line_break_mode: UILineBreakMode,
     number_of_lines: NSInteger,
+    adjusts_font_size_to_fit_width: bool,
+    minimum_font_size: CGFloat,
+    /// `UIColor*`, used instead of `text_color` while highlighted.
+    highlighted_text_color: id,
+    highlighted: bool,
 }
 impl_HostObject_with_superclass!(UILabelHostObject);
 impl Default for UILabelHostObject {
@@ -45,6 +50,10 @@ impl Default for UILabelHostObject {
             text_alignment: UITextAlignmentLeft,
             line_break_mode: UILineBreakModeTailTruncation,
             number_of_lines: 1,
+            adjusts_font_size_to_fit_width: false,
+            minimum_font_size: 0.0,
+            highlighted_text_color: nil,
+            highlighted: false,
         }
     }
 }
@@ -64,7 +73,10 @@ pub const CLASSES: ClassExports = objc_classes! {
     let this: id = msg_super![env; this initWithCoder:coder];
 
     // TODO: Decode other property values from the coder
-    () = msg![env; this setFont:nil];
+    // A missing font gets the default from the setter.
+    let key_ns_string = get_static_str(env, "UIFont");
+    let font: id = msg![env; coder decodeObjectForKey:key_ns_string];
+    () = msg![env; this setFont:font];
 
     let key_ns_string = get_static_str(env, "UIText");
     let text: id = msg![env; coder decodeObjectForKey:key_ns_string];
@@ -85,6 +97,18 @@ pub const CLASSES: ClassExports = objc_classes! {
         bg_color
     };
     () = msg![env; this setBackgroundColor:bg_color];
+
+    let key_ns_string = get_static_str(env, "UITextAlignment");
+    let alignment: NSInteger = msg![env; coder decodeIntegerForKey:key_ns_string];
+    () = msg![env; this setTextAlignment:alignment];
+
+    let key_ns_string = get_static_str(env, "UIAdjustsFontSizeToFit");
+    let adjusts: bool = msg![env; coder decodeBoolForKey:key_ns_string];
+    () = msg![env; this setAdjustsFontSizeToFitWidth:adjusts];
+
+    let key_ns_string = get_static_str(env, "UIMinimumFontSize");
+    let minimum: CGFloat = msg![env; coder decodeFloatForKey:key_ns_string];
+    () = msg![env; this setMinimumFontSize:minimum];
 
     // Built-in views don't have user-controlled opaqueness.
     () = msg_super![env; this setOpaque:false];
@@ -113,10 +137,15 @@ pub const CLASSES: ClassExports = objc_classes! {
         text_alignment: _,
         line_break_mode: _,
         number_of_lines: _,
+        adjusts_font_size_to_fit_width: _,
+        minimum_font_size: _,
+        highlighted_text_color,
+        highlighted: _,
     } = env.objc.borrow(this);
     release(env, text);
     release(env, font);
     release(env, text_color);
+    release(env, highlighted_text_color);
     msg_super![env; this dealloc]
 }
 
@@ -186,15 +215,38 @@ pub const CLASSES: ClassExports = objc_classes! {
     () = msg![env; this setNeedsDisplay];
 }
 
-- (bool)adjustsFontSizeToFitWidth {
-    false // default value
+- (id)highlightedTextColor {
+    env.objc.borrow::<UILabelHostObject>(this).highlighted_text_color
 }
-- (())setAdjustsFontSizeToFitWidth:(bool)adjusts {
-    assert!(!adjusts); // TODO
+- (())setHighlightedTextColor:(id)color { // UIColor*
+    retain(env, color);
+    let host = env.objc.borrow_mut::<UILabelHostObject>(this);
+    let old = std::mem::replace(&mut host.highlighted_text_color, color);
+    release(env, old);
+    () = msg![env; this setNeedsDisplay];
+}
+- (bool)isHighlighted {
+    env.objc.borrow::<UILabelHostObject>(this).highlighted
+}
+- (())setHighlighted:(bool)highlighted {
+    env.objc.borrow_mut::<UILabelHostObject>(this).highlighted = highlighted;
+    () = msg![env; this setNeedsDisplay];
 }
 
+- (bool)adjustsFontSizeToFitWidth {
+    env.objc.borrow::<UILabelHostObject>(this).adjusts_font_size_to_fit_width
+}
+- (())setAdjustsFontSizeToFitWidth:(bool)adjusts {
+    env.objc.borrow_mut::<UILabelHostObject>(this).adjusts_font_size_to_fit_width = adjusts;
+    () = msg![env; this setNeedsDisplay];
+}
+
+- (CGFloat)minimumFontSize {
+    env.objc.borrow::<UILabelHostObject>(this).minimum_font_size
+}
 - (())setMinimumFontSize:(CGFloat)size {
-    todo_objc_setter!(this, size);
+    env.objc.borrow_mut::<UILabelHostObject>(this).minimum_font_size = size;
+    () = msg![env; this setNeedsDisplay];
 }
 
 - (id)textColor {
@@ -282,14 +334,35 @@ pub const CLASSES: ClassExports = objc_classes! {
         text_alignment,
         line_break_mode,
         number_of_lines,
+        adjusts_font_size_to_fit_width,
+        minimum_font_size,
+        highlighted_text_color,
+        highlighted,
     } = env.objc.borrow_mut(this);
 
+    let text_color = if highlighted && highlighted_text_color != nil {
+        highlighted_text_color
+    } else {
+        text_color
+    };
     let (r, g, b, a) = ui_color::get_rgba(&env.objc, text_color);
     CGContextSetRGBFillColor(env, context, r, g, b, a);
 
     let single_line = number_of_lines == 1;
 
-    let calculated_size: CGSize = msg![env; this sizeThatFits:(bounds.size)];
+    let mut calculated_size: CGSize = msg![env; this sizeThatFits:(bounds.size)];
+
+    // Shrink the font a point at a time until the text fits, but not below
+    // the minimum size.
+    let mut font = font;
+    if single_line && adjusts_font_size_to_fit_width && text != nil {
+        let mut size: CGFloat = msg![env; font pointSize];
+        while calculated_size.width > bounds.size.width && size > minimum_font_size {
+            size = (size - 1.0).max(minimum_font_size);
+            font = msg![env; font fontWithSize:size];
+            calculated_size = msg![env; text sizeWithFont:font];
+        }
+    }
 
     // UILabel always vertically centers text
     // (TODO: check whether this is actually a UILabel thing, or a property of

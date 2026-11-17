@@ -7,14 +7,16 @@
 
 use super::cg_affine_transform::{CGAffineTransform, CGAffineTransformIdentity};
 use super::cg_color_space::{
-    kCGColorSpaceGenericGray, kCGColorSpaceGenericRGB, CGColorSpaceHostObject, CGColorSpaceRef,
+    kCGColorSpaceGenericGray, kCGColorSpaceGenericRGB, kCGColorSpaceModelMonochrome,
+    CGColorSpaceHostObject, CGColorSpaceRef,
 };
 use super::cg_context::{
-    blend_mode_name, kCGBlendModeCopy, kCGBlendModeDarken, kCGBlendModeLighten,
+    blend_mode_name, kCGBlendModeClear, kCGBlendModeCopy, kCGBlendModeDarken, kCGBlendModeLighten,
     kCGBlendModeMultiply, kCGBlendModeNormal, kCGBlendModeScreen, kCGBlendModeSourceAtop,
     kCGBlendModeSourceIn, kCGBlendModeSourceOut, CGBlendMode, CGContextHostObject, CGContextRef,
     CGContextSubclass,
 };
+use super::cg_gradient::{self, CGGradientRef};
 use super::cg_image::{
     self, kCGBitmapAlphaInfoMask, kCGBitmapByteOrderMask, kCGImageAlphaFirst, kCGImageAlphaLast,
     kCGImageAlphaNone, kCGImageAlphaNoneSkipFirst, kCGImageAlphaNoneSkipLast, kCGImageAlphaOnly,
@@ -22,12 +24,14 @@ use super::cg_image::{
     kCGImageByteOrder32Little, kCGImageByteOrderDefault, CGBitmapInfo, CGImageAlphaInfo,
     CGImageByteOrderInfo, CGImageRef,
 };
+use super::cg_path::{kCGLineCapButt, kCGLineCapRound, kCGLineCapSquare};
 use super::{CGFloat, CGPoint, CGRect};
 use crate::dyld::{export_c_func, FunctionExports};
 use crate::image::{gamma_decode, gamma_encode, Image};
 use crate::mem::{GuestUSize, Mem, MutVoidPtr, Ptr};
 use crate::objc::ObjC;
 use crate::Environment;
+use std::rc::Rc;
 
 #[derive(Copy, Clone)]
 pub(super) struct CGBitmapContextData {
@@ -90,12 +94,20 @@ pub fn CGBitmapContextCreate(
         }),
         // TODO: is this the correct default?
         rgb_fill_color: (0.0, 0.0, 0.0, 0.0),
+        rgb_stroke_color: (0.0, 0.0, 0.0, 0.0),
         font: Ptr::null(),
         font_size: 14.0,
         transform: CGAffineTransformIdentity,
         blend_mode: kCGBlendModeNormal,
         text_transform: None,
         state_stack: Vec::new(),
+        line_cap: kCGLineCapButt,
+        line_width: 1.0,
+        // Device gray, as on iOS.
+        fill_color_space: kCGColorSpaceModelMonochrome,
+        stroke_color_space: kCGColorSpaceModelMonochrome,
+        path: tiny_skia::PathBuilder::new(),
+        clip: None,
     };
     let isa = env
         .objc
@@ -439,7 +451,11 @@ fn put_pixel(
 
     // Blending like this must be done in linear RGB, so this must come before
     // gamma encoding.
-    let (r, g, b, a) = if blend {
+    let (r, g, b, a) = if blend && blend_mode == kCGBlendModeClear {
+        // Whatever is drawn, the result is transparent (black without
+        // alpha). This ignores how much of the pixel a shape covers too.
+        (0.0, 0.0, 0.0, 0.0)
+    } else if blend {
         match data.alpha_info {
             kCGImageAlphaLast | kCGImageAlphaFirst => blend_straight(bg_pixel, pixel, blend_mode),
             kCGImageAlphaPremultipliedLast | kCGImageAlphaPremultipliedFirst => {
@@ -485,6 +501,7 @@ pub struct CGBitmapContextDrawer<'a> {
     rgb_fill_color: (CGFloat, CGFloat, CGFloat, CGFloat),
     blend_mode: CGBlendMode,
     transform: CGAffineTransform,
+    clip: Option<Rc<tiny_skia::Mask>>,
     pixels: &'a mut [u8],
 }
 impl CGBitmapContextDrawer<'_> {
@@ -498,6 +515,7 @@ impl CGBitmapContextDrawer<'_> {
             rgb_fill_color,
             transform,
             blend_mode,
+            ref clip,
             ..
         } = objc.borrow(context);
 
@@ -508,6 +526,7 @@ impl CGBitmapContextDrawer<'_> {
             rgb_fill_color,
             blend_mode,
             transform,
+            clip: clip.clone(),
             pixels,
         }
     }
@@ -527,19 +546,62 @@ impl CGBitmapContextDrawer<'_> {
     /// Get the current fill color. The returned color is linear RGB, not sRGB.
     /// It has premultiplied alpha if the context does.
     pub fn rgb_fill_color(&self) -> (CGFloat, CGFloat, CGFloat, CGFloat) {
-        let multiply_by = match self.bitmap_info.alpha_info {
-            kCGImageAlphaPremultipliedLast | kCGImageAlphaPremultipliedFirst => {
-                self.rgb_fill_color.3
-            }
-            _ => 1.0,
+        self.color_for_drawing(self.rgb_fill_color)
+    }
+    /// Converts an sRGB color, with straight alpha, as
+    /// [Self::rgb_fill_color] does.
+    pub fn color_for_drawing(
+        &self,
+        color: (CGFloat, CGFloat, CGFloat, CGFloat),
+    ) -> (CGFloat, CGFloat, CGFloat, CGFloat) {
+        let multiply_by = if self.is_premultiplied() {
+            color.3
+        } else {
+            1.0
         };
         // Multiplying before decoding matches the Simulator's output.
         (
-            gamma_decode(self.rgb_fill_color.0 * multiply_by),
-            gamma_decode(self.rgb_fill_color.1 * multiply_by),
-            gamma_decode(self.rgb_fill_color.2 * multiply_by),
-            self.rgb_fill_color.3, // alpha is always linear
+            gamma_decode(color.0 * multiply_by),
+            gamma_decode(color.1 * multiply_by),
+            gamma_decode(color.2 * multiply_by),
+            color.3, // alpha is always linear
         )
+    }
+    fn is_premultiplied(&self) -> bool {
+        matches!(
+            self.bitmap_info.alpha_info,
+            kCGImageAlphaPremultipliedLast | kCGImageAlphaPremultipliedFirst
+        )
+    }
+    /// Draws `color` (from [Self::color_for_drawing]) where a mask covers
+    /// the bitmap, partly covered pixels being partly transparent.
+    pub fn fill_mask(
+        &mut self,
+        mask: &tiny_skia::Mask,
+        color: (CGFloat, CGFloat, CGFloat, CGFloat),
+    ) {
+        let width = mask.width() as usize;
+        for (i, &coverage) in mask.data().iter().enumerate() {
+            if coverage == 0 {
+                continue;
+            }
+            let color = self.with_coverage(color, coverage);
+            let coords = ((i % width) as i32, (i / width) as i32);
+            self.put_pixel(coords, color, /* blend: */ true);
+        }
+    }
+    /// Makes a color partly transparent, for a partly covered pixel.
+    fn with_coverage(
+        &self,
+        color: (CGFloat, CGFloat, CGFloat, CGFloat),
+        coverage: u8,
+    ) -> (CGFloat, CGFloat, CGFloat, CGFloat) {
+        let c = coverage as f32 / 255.0;
+        if self.is_premultiplied() {
+            (color.0 * c, color.1 * c, color.2 * c, color.3 * c)
+        } else {
+            (color.0, color.1, color.2, color.3 * c)
+        }
     }
     /// Set the pixel at `coords` to `color`. `color` must be linear RGB, not
     /// sRGB! Note that `coords` are absolute: you must do transformation
@@ -550,6 +612,21 @@ impl CGBitmapContextDrawer<'_> {
         color: (CGFloat, CGFloat, CGFloat, CGFloat),
         blend: bool,
     ) {
+        let mut color = color;
+        if let Some(clip) = &self.clip {
+            let (x, y) = coords;
+            if x < 0 || y < 0 || x >= clip.width() as i32 || y >= clip.height() as i32 {
+                return;
+            }
+            let coverage = clip.data()[y as usize * clip.width() as usize + x as usize];
+            // Without blending, a partly covered pixel can't be partly set.
+            if coverage == 0 || (!blend && coverage < 128) {
+                return;
+            }
+            if blend {
+                color = self.with_coverage(color, coverage);
+            }
+        }
         put_pixel(
             &self.bitmap_info,
             self.pixels,
@@ -630,6 +707,7 @@ fn test_iter_transformed_pixels() {
             rgb_fill_color: (0.0, 0.0, 0.0, 0.0),
             blend_mode: kCGBlendModeNormal,
             transform,
+            clip: None,
             pixels: &mut [],
         }
     }
@@ -716,6 +794,22 @@ pub(super) fn fill_rect(env: &mut Environment, context: CGContextRef, rect: CGRe
     }
 }
 
+/// Implementation of `CGContextFillEllipseInRect`
+pub(super) fn fill_ellipse(env: &mut Environment, context: CGContextRef, rect: CGRect) {
+    let mut drawer = CGBitmapContextDrawer::new(&env.objc, &mut env.mem, context);
+    let color = drawer.rgb_fill_color();
+
+    for ((x, y), (u, v)) in drawer.iter_transformed_pixels(rect) {
+        let dx_sqr = (2.0 * u - 1.0).powi(2);
+        let dy_sqr = (2.0 * v - 1.0).powi(2);
+
+        // TODO: correct anti-aliasing
+        if dx_sqr + dy_sqr <= 1.0 {
+            drawer.put_pixel((x, y), color, /* blend: */ true);
+        }
+    }
+}
+
 /// Implementation of `CGContextDrawImage` for `CGBitmapContext`.
 pub(super) fn draw_image(
     env: &mut Environment,
@@ -787,3 +881,103 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CGBitmapContextGetHeight(_)),
     export_c_func!(CGBitmapContextGetBytesPerRow(_)),
 ];
+
+pub(super) fn to_skia_transform(t: CGAffineTransform) -> tiny_skia::Transform {
+    tiny_skia::Transform::from_row(t.a, t.b, t.c, t.d, t.tx, t.ty)
+}
+
+/// Implementation of `CGContextFillPath` and `CGContextStrokePath`, for a
+/// path in device space.
+pub(super) fn draw_path(
+    env: &mut Environment,
+    context: CGContextRef,
+    path: &tiny_skia::Path,
+    stroke: bool,
+) {
+    let host_obj = env.objc.borrow::<CGContextHostObject>(context);
+    let (transform, line_width, line_cap, stroke_color) = (
+        host_obj.transform,
+        host_obj.line_width,
+        host_obj.line_cap,
+        host_obj.rgb_stroke_color,
+    );
+    let mut drawer = CGBitmapContextDrawer::new(&env.objc, &mut env.mem, context);
+    let Some(mut mask) = tiny_skia::Mask::new(drawer.width(), drawer.height()) else {
+        return;
+    };
+    let (path, color) = if stroke {
+        // Stroked in user space, so the line's width is transformed too.
+        let line_cap = match line_cap {
+            kCGLineCapRound => tiny_skia::LineCap::Round,
+            kCGLineCapSquare => tiny_skia::LineCap::Square,
+            _ => tiny_skia::LineCap::Butt,
+        };
+        let style = tiny_skia::Stroke {
+            width: line_width,
+            line_cap,
+            // iOS's defaults, which can't be changed yet.
+            line_join: tiny_skia::LineJoin::Miter,
+            miter_limit: 10.0,
+            dash: None,
+        };
+        let ts = to_skia_transform(transform);
+        let Some(path) = ts
+            .invert()
+            .and_then(|inverse| path.clone().transform(inverse))
+            .and_then(|path| path.stroke(&style, drawer.transform_scale()))
+            .and_then(|path| path.transform(ts))
+        else {
+            return;
+        };
+        (path, drawer.color_for_drawing(stroke_color))
+    } else {
+        (path.clone(), drawer.rgb_fill_color())
+    };
+    mask.fill_path(
+        &path,
+        tiny_skia::FillRule::Winding,
+        /* anti_alias: */ true,
+        tiny_skia::Transform::identity(),
+    );
+    drawer.fill_mask(&mask, color);
+}
+
+const kCGGradientDrawsBeforeStartLocation: u32 = 1;
+const kCGGradientDrawsAfterEndLocation: u32 = 2;
+
+/// Implementation of `CGContextDrawLinearGradient`: the whole bitmap is
+/// painted, but beyond the ends only if `options` say so.
+pub(super) fn draw_linear_gradient(
+    env: &mut Environment,
+    context: CGContextRef,
+    gradient: CGGradientRef,
+    start: CGPoint,
+    end: CGPoint,
+    options: u32,
+) {
+    let stops = cg_gradient::stops(&env.objc, gradient).to_vec();
+    let mut drawer = CGBitmapContextDrawer::new(&env.objc, &mut env.mem, context);
+    let (dx, dy) = (end.x - start.x, end.y - start.y);
+    let length_squared = dx * dx + dy * dy;
+    if stops.is_empty() || length_squared == 0.0 {
+        return;
+    }
+    let inverse = drawer.transform.invert();
+    for y in 0..drawer.height() {
+        for x in 0..drawer.width() {
+            let p = inverse.apply_to_point(CGPoint {
+                x: x as f32 + 0.5,
+                y: y as f32 + 0.5,
+            });
+            let t = ((p.x - start.x) * dx + (p.y - start.y) * dy) / length_squared;
+            if (t < 0.0 && options & kCGGradientDrawsBeforeStartLocation == 0)
+                || (t > 1.0 && options & kCGGradientDrawsAfterEndLocation == 0)
+            {
+                continue;
+            }
+            let color = cg_gradient::color_at(&stops, t.clamp(0.0, 1.0));
+            let color = drawer.color_for_drawing(color);
+            drawer.put_pixel((x as i32, y as i32), color, /* blend: */ true);
+        }
+    }
+}

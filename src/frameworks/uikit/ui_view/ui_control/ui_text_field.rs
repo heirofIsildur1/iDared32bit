@@ -8,6 +8,10 @@
 //! Useful resources:
 //! - [UITextFieldDelegate overview](https://developer.apple.com/documentation/uikit/uitextfielddelegate?language=objc)
 
+use super::{
+    send_actions, UIControlEventEditingChanged, UIControlEventEditingDidBegin,
+    UIControlEventEditingDidEnd, UIControlEventEditingDidEndOnExit,
+};
 use crate::dyld::{ConstantExports, HostConstant};
 use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect};
 use crate::frameworks::foundation::ns_string::to_rust_string;
@@ -132,16 +136,6 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (())setText:(id)text { // NSString*
     let text_label = env.objc.borrow_mut::<UITextFieldHostObject>(this).text_label;
     () = msg![env; text_label setText:text];
-
-    // This will work only if all the text changes will call setText:!
-    // This is the case right now.
-    // (see `handle_text` and `handle_backspace` helper functions below)
-    // TODO: actually check if setText: send this notif on each change
-    // (e.g. does it send the notif if text hasn't changed)
-    let center: id = msg_class![env; NSNotificationCenter defaultCenter];
-    let name = ns_string::get_static_str(env, UITextFieldTextDidChangeNotification);
-    // TODO: userInfo
-    let _: () = msg![env; center postNotificationName:name object:this userInfo:nil];
 }
 
 - (())setTextColor:(id)color { // UIColor*
@@ -277,6 +271,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     if msg![env; delegate respondsToSelector:sel] {
         () = msg![env; delegate textFieldDidBeginEditing:this];
     }
+    send_actions(env, this, nil, UIControlEventEditingDidBegin);
 
     true
 }
@@ -314,6 +309,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     if msg![env; delegate respondsToSelector:sel] {
         () = msg![env; delegate textFieldDidEndEditing:this];
     }
+    send_actions(env, this, nil, UIControlEventEditingDidEnd);
 
     true
 }
@@ -369,6 +365,7 @@ pub fn handle_text(env: &mut Environment, text_field: id, text: String) {
         () = msg![env; text_label setText:new_text];
         () = msg![env; text_field setNeedsDisplay];
         release(env, new_text);
+        text_did_change(env, text_field);
     }
     release(env, txt);
 }
@@ -404,6 +401,7 @@ pub fn handle_backspace(env: &mut Environment, text_field: id) {
         || !responds
         || msg![env; delegate textField:text_field shouldChangeCharactersInRange:range replacementString:empty];
     if should {
+        // Autoreleased, so not released here.
         let new_text: id = msg![env; curr_text substringToIndex:(len-1)];
         log_dbg!(
             "handle_backspace, new_text: {}",
@@ -412,8 +410,17 @@ pub fn handle_backspace(env: &mut Environment, text_field: id) {
         // TODO: refactor this to proper update() method
         () = msg![env; text_label setText:new_text];
         () = msg![env; text_field setNeedsDisplay];
-        release(env, new_text);
+        text_did_change(env, text_field);
     }
+}
+
+/// Like on iOS, only edits by the user (not setText:) notify.
+fn text_did_change(env: &mut Environment, text_field: id) {
+    send_actions(env, text_field, nil, UIControlEventEditingChanged);
+    let center: id = msg_class![env; NSNotificationCenter defaultCenter];
+    let name = ns_string::get_static_str(env, UITextFieldTextDidChangeNotification);
+    // TODO: userInfo
+    let _: () = msg![env; center postNotificationName:name object:text_field userInfo:nil];
 }
 
 pub fn handle_return(env: &mut Environment, text_field: id) {
@@ -425,8 +432,10 @@ pub fn handle_return(env: &mut Environment, text_field: id) {
     let sel: SEL = env
         .objc
         .register_host_selector("textFieldShouldReturn:".to_string(), &mut env.mem);
-    if msg![env; delegate respondsToSelector:sel] {
-        log_dbg!("handle_return");
-        () = msg![env; delegate textFieldShouldReturn:text_field];
+    let should = !msg![env; delegate respondsToSelector:sel]
+        || msg![env; delegate textFieldShouldReturn:text_field];
+    // As on iOS, the keyboard is hidden if anything handles the event.
+    if should && send_actions(env, text_field, nil, UIControlEventEditingDidEndOnExit) {
+        let _: bool = msg![env; text_field resignFirstResponder];
     }
 }

@@ -7,13 +7,13 @@
 
 use super::UIBarItemHostObject;
 use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect, CGSize};
-use crate::frameworks::foundation::ns_string::to_rust_string;
+use crate::frameworks::foundation::ns_string::{get_static_str, to_rust_string};
 use crate::frameworks::foundation::NSInteger;
 use crate::frameworks::uikit::ui_font::UITextAlignmentCenter;
 use crate::frameworks::uikit::ui_view::ui_control::UIControlEventTouchUpInside;
 use crate::objc::{
-    id, impl_HostObject_with_superclass, msg, msg_class, msg_super, nil, objc_classes, release,
-    retain, ClassExports, NSZonePtr, SEL,
+    id, impl_HostObject_with_superclass, msg, msg_class, msg_send, msg_super, nil, objc_classes,
+    release, retain, ClassExports, NSZonePtr, SEL,
 };
 
 pub type UIBarButtonItemStyle = NSInteger;
@@ -22,12 +22,14 @@ pub const UIBarButtonItemStyleBordered: UIBarButtonItemStyle = 1;
 pub const UIBarButtonItemStyleDone: UIBarButtonItemStyle = 2;
 
 pub type UIBarButtonSystemItem = NSInteger;
+pub const UIBarButtonSystemItemDone: UIBarButtonSystemItem = 0;
 pub const UIBarButtonSystemItemFlexibleSpace: UIBarButtonSystemItem = 5;
 pub const UIBarButtonSystemItemFixedSpace: UIBarButtonSystemItem = 6;
 
 pub struct UIBarButtonItemHostObject {
     superclass: UIBarItemHostObject,
     pub style: UIBarButtonItemStyle,
+    /// Weak reference.
     pub target: id,
     pub action: Option<SEL>,
     pub system_item: Option<UIBarButtonSystemItem>,
@@ -56,9 +58,11 @@ impl Default for UIBarButtonItemHostObject {
 }
 
 fn make_label(env: &mut crate::Environment, title: id) -> id {
-    let font: id = msg_class![env; UIFont systemFontOfSize:17_f32];
-    let title_color: id = msg_class![env; UIColor blackColor];
-    let item_bg_color: id = msg_class![env; UIColor whiteColor];
+    // As on iPhone OS 3: white bold text, drawn over the button background
+    // that UIToolbar draws.
+    let font: id = msg_class![env; UIFont boldSystemFontOfSize:12_f32];
+    let title_color: id = msg_class![env; UIColor whiteColor];
+    let item_bg_color: id = msg_class![env; UIColor clearColor];
     let init_frame = CGRect {
         origin: CGPoint { x: 0.0, y: 0.0 },
         size: CGSize {
@@ -73,12 +77,12 @@ fn make_label(env: &mut crate::Environment, title: id) -> id {
     () = msg![env; label setTextColor:title_color];
     () = msg![env; label setFont:font];
     () = msg![env; label setBackgroundColor:item_bg_color];
-    let layer: id = msg![env; label layer];
-    () = msg![env; layer setCornerRadius:(10.0 as CGFloat)];
     label
 }
 
-fn make_custom_view(env: &mut crate::Environment, label: id, target: id, action: SEL) -> id {
+/// The button's control sends the item's action through it, so a target or
+/// action set later (e.g. by a nib) is used, and the sender is the item.
+fn make_custom_view(env: &mut crate::Environment, label: id, item: id) -> id {
     let init_frame = CGRect {
         origin: CGPoint { x: 0.0, y: 0.0 },
         size: CGSize {
@@ -91,9 +95,10 @@ fn make_custom_view(env: &mut crate::Environment, label: id, target: id, action:
     if label != nil {
         () = msg![env; control addSubview:label];
     }
-    if target != nil {
-        () = msg![env; control addTarget:target action:action forControlEvents:UIControlEventTouchUpInside];
-    }
+    let action = env
+        .objc
+        .register_host_selector("_touchHLE_sendAction".to_string(), &mut env.mem);
+    () = msg![env; control addTarget:item action:action forControlEvents:UIControlEventTouchUpInside];
     control
 }
 
@@ -142,7 +147,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     );
 
     let label = make_label(env, title);
-    let custom_view = make_custom_view(env, label, target, action);
+    let custom_view = make_custom_view(env, label, this);
 
     {
         let host = env.objc.borrow_mut::<UIBarButtonItemHostObject>(this);
@@ -156,9 +161,6 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     if title != nil {
         retain(env, title);
-    }
-    if target != nil {
-        retain(env, target);
     }
     retain(env, custom_view);
 
@@ -177,21 +179,30 @@ pub const CLASSES: ClassExports = objc_classes! {
         action
     );
 
-    let label = if system_item == UIBarButtonSystemItemFlexibleSpace
-        || system_item == UIBarButtonSystemItemFixedSpace
-    {
-        nil
-    } else {
-        unimplemented!(
+    let (title, label, style) = match system_item {
+        UIBarButtonSystemItemDone => {
+            let title = get_static_str(env, "Done");
+            let label = make_label(env, title);
+            (title, label, UIBarButtonItemStyleDone)
+        }
+
+        UIBarButtonSystemItemFlexibleSpace
+        | UIBarButtonSystemItemFixedSpace => {
+            (nil, nil, UIBarButtonItemStylePlain)
+        }
+
+        _ => unimplemented!(
             "UIBarButtonSystemItem {} rendering not implemented",
             system_item
-        );
+        ),
     };
 
-    let custom_view = make_custom_view(env, label, target, action);
+    let custom_view = make_custom_view(env, label, this);
 
     {
         let host = env.objc.borrow_mut::<UIBarButtonItemHostObject>(this);
+        host.superclass.title = title;
+        host.style = style;
         host.system_item = Some(system_item);
         host.target = target;
         host.action = Some(action);
@@ -199,8 +210,8 @@ pub const CLASSES: ClassExports = objc_classes! {
         host.label = label;
     }
 
-    if target != nil {
-        retain(env, target);
+    if title != nil {
+        retain(env, title);
     }
     retain(env, custom_view);
 
@@ -248,8 +259,52 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.borrow::<UIBarButtonItemHostObject>(this).target
 }
 
+// Like a control's, the target isn't retained.
 - (())setTarget:(id)target {
     env.objc.borrow_mut::<UIBarButtonItemHostObject>(this).target = target;
+}
+
+- (())_touchHLE_sendAction {
+    let host = env.objc.borrow::<UIBarButtonItemHostObject>(this);
+    let (target, action) = (host.target, host.action);
+    // No action: something else handles taps (e.g. a back button).
+    let Some(action) = action else {
+        return;
+    };
+    if target == nil {
+        log!("TODO: UIBarButtonItem {:?} action with no target", this);
+        return;
+    }
+    let sel_str = action.as_str(&env.mem);
+    match sel_str.bytes().filter(|&b| b == b':').count() {
+        0 => msg_send(env, (target, action)),
+        1 => msg_send(env, (target, action, this)),
+        _ => msg_send(env, (target, action, this, nil)),
+    }
+}
+
+// NSCoding implementation
+- (id)initWithCoder:(id)coder {
+    let key = get_static_str(env, "UIIsSystemItem");
+    let is_system_item: bool = msg![env; coder decodeBoolForKey:key];
+    let key = get_static_str(env, "UIStyle");
+    let style: NSInteger = msg![env; coder decodeIntegerForKey:key];
+    // Any selector: the action is cleared below.
+    let action = env
+        .objc
+        .register_host_selector("_touchHLE_sendAction".to_string(), &mut env.mem);
+    let this: id = if is_system_item {
+        let key = get_static_str(env, "UISystemItem");
+        let item: NSInteger = msg![env; coder decodeIntegerForKey:key];
+        msg![env; this initWithBarButtonSystemItem:item target:nil action:action]
+    } else {
+        let key = get_static_str(env, "UITitle");
+        let title: id = msg![env; coder decodeObjectForKey:key];
+        msg![env; this initWithTitle:title style:style target:nil action:action]
+    };
+    // The nib connects the target and action afterwards.
+    env.objc.borrow_mut::<UIBarButtonItemHostObject>(this).action = None;
+    this
 }
 
 - (CGFloat)width {
@@ -266,12 +321,15 @@ pub const CLASSES: ClassExports = objc_classes! {
     let custom_view = host.custom_view;
     if label != nil {
         let label_size: CGSize = msg![env; label sizeThatFits:size];
+        // 10pt either side of the title, as on iPhone OS 3.
         CGSize {
-            width: label_size.width + 16.0,
+            width: label_size.width + 20.0,
             height: size.height,
         }
     } else if custom_view != nil {
-        msg![env; custom_view sizeThatFits:size]
+        // Custom views keep their own size.
+        let bounds: CGRect = msg![env; custom_view bounds];
+        bounds.size
     } else {
         CGSize { width: 0.0, height: size.height }
     }
@@ -309,7 +367,6 @@ pub const CLASSES: ClassExports = objc_classes! {
     );
 
     release(env, superclass.title);
-    release(env, target);
     release(env, custom_view);
     msg_super![env; this dealloc]
 }

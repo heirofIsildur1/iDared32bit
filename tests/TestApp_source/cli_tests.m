@@ -7,6 +7,7 @@
 // This file contains the command-line automated tests. tests/integration.rs
 // runs these automatically.
 
+#include <CoreFoundation/CFArray.h>
 #include <CoreFoundation/CFBase.h>
 #include <CoreFoundation/CFBundle.h>
 #include <CoreFoundation/CFDictionary.h>
@@ -20,6 +21,7 @@
 #include <fenv.h>
 #include <fnmatch.h>
 #include <glob.h>
+#include <libgen.h>
 #include <locale.h>
 #include <mach/kern_return.h>
 #include <mach/thread_info.h>
@@ -28,11 +30,14 @@
 #include <pthread.h>
 #include <semaphore.h>
 #include <setjmp.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mount.h>
+#include <sys/socket.h>
 #include <sys/sysctl.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -660,6 +665,416 @@ int test_vsnprintf() {
   return 0;
 }
 
+int test_NSObject_self() {
+  if ((Class)[NSObject self] != [NSObject class])
+    return -1;
+  NSObject *obj = [NSObject new];
+  id result = [obj self];
+  [obj release];
+  if (result != obj)
+    return -2;
+  // NSObject is the root class.
+  if ([NSObject superclass] != nil ||
+      [NSMutableArray superclass] != [NSArray class])
+    return -3;
+  NSMutableArray *array = [NSMutableArray new];
+  Class superclass = [array superclass];
+  [array release];
+  // NSMutableArray's private subclasses vary, but are all mutable arrays.
+  return [superclass isSubclassOfClass:[NSArray class]] ? 0 : -4;
+}
+
+@interface PropertyListTest : NSObject {
+  int _count;
+  id _obj;
+}
+@property(nonatomic) int count;
+@property(nonatomic, retain) id obj;
+@end
+
+@implementation PropertyListTest
+@synthesize count = _count;
+@synthesize obj = _obj;
+@end
+
+@interface NoPropertiesTest : NSObject
+@end
+
+@implementation NoPropertiesTest
+@end
+
+int test_class_copyPropertyList() {
+  unsigned int count = 0;
+  objc_property_t *list =
+      class_copyPropertyList([PropertyListTest class], &count);
+  if (list == NULL || count != 2)
+    return -1;
+  int found = 0;
+  for (unsigned int i = 0; i < count; i++) {
+    const char *name = property_getName(list[i]);
+    const char *attributes = property_getAttributes(list[i]);
+    if (strcmp(name, "count") == 0 && strcmp(attributes, "Ti,N,V_count") == 0)
+      found |= 1;
+    else if (strcmp(name, "obj") == 0 &&
+             strcmp(attributes, "T@,&,N,V_obj") == 0)
+      found |= 2;
+  }
+  int res = found == 3 && list[count] == NULL ? 0 : -2;
+  free(list);
+
+  // A class without properties.
+  count = 1;
+  list = class_copyPropertyList([NoPropertiesTest class], &count);
+  if (res == 0 && count != 0)
+    res = -3;
+  free(list);
+  return res;
+}
+
+@interface KVCGetterTest : NSObject {
+  int _count;
+  float _ratio;
+  id _name;
+}
+- (int)count;
+- (BOOL)isEnabled;
+@end
+
+@implementation KVCGetterTest
+- (instancetype)init {
+  if ((self = [super init])) {
+    _count = 3;
+    _ratio = 1.5;
+  }
+  return self;
+}
+- (int)count {
+  return 7;
+}
+- (BOOL)isEnabled {
+  return YES;
+}
+@end
+
+int test_statfs() {
+  // Any existing path works, not just ones in Documents.
+  struct statfs buf;
+  if (statfs([NSHomeDirectory() UTF8String], &buf) != 0 || buf.f_bsize == 0)
+    return -1;
+  errno = 0;
+  if (statfs("/does/not/exist", &buf) != -1 || errno != ENOENT)
+    return -2;
+  return 0;
+}
+
+int test_Foundation_constants() {
+  NSAutoreleasePool *pool = [NSAutoreleasePool new];
+  int res = 0;
+  if (![NSURLErrorDomain
+          isEqualToString:[NSString stringWithUTF8String:"NSURLErrorDomain"]] ||
+      ![NSUnderlyingErrorKey
+          isEqualToString:[NSString stringWithUTF8String:"NSUnderlyingError"]])
+    res = -1;
+  // iPhone OS 2.0 is 678.24; later versions are higher.
+  if (res == 0 && NSFoundationVersionNumber < 678.24)
+    res = -2;
+  NSDictionary *attrs = [[NSFileManager defaultManager]
+      attributesOfFileSystemForPath:NSHomeDirectory()
+                              error:NULL];
+  NSNumber *size = [attrs objectForKey:NSFileSystemSize];
+  NSNumber *free = [attrs objectForKey:NSFileSystemFreeSize];
+  if (res == 0 && (size == nil || free == nil ||
+                   [size unsignedLongLongValue] < [free unsignedLongLongValue]))
+    res = -3;
+  [pool drain];
+  return res;
+}
+
+static CFComparisonResult compare_ints(const void *a, const void *b,
+                                       void *context) {
+  long x = (long)a, y = (long)b;
+  return x < y ? kCFCompareLessThan
+               : (x > y ? kCFCompareGreaterThan : kCFCompareEqualTo);
+}
+
+int test_CFArray_sort_and_copy() {
+  // With NULL callbacks, the values needn't be objects.
+  CFMutableArrayRef array = CFArrayCreateMutable(NULL, 0, NULL);
+  long values[] = {3, 1, 2, 1};
+  for (int i = 0; i < 4; i++)
+    CFArrayAppendValue(array, (const void *)values[i]);
+  // Only the last three are sorted.
+  CFArraySortValues(array, CFRangeMake(1, 3), compare_ints, NULL);
+  long expected[] = {3, 1, 1, 2};
+  int res = 0;
+  for (int i = 0; i < 4; i++)
+    if ((long)CFArrayGetValueAtIndex(array, i) != expected[i])
+      res = -1;
+  CFMutableArrayRef copy = CFArrayCreateMutableCopy(NULL, 0, array);
+  if (res == 0 && (CFArrayGetCount(copy) != 4 ||
+                   (long)CFArrayGetValueAtIndex(copy, 3) != 2))
+    res = -2;
+  CFRelease(copy);
+  CFRelease(array);
+  return res;
+}
+
+int test_NSAssertionHandler() {
+  // A failure would end the test app, so only the handler itself is checked.
+  NSAssertionHandler *handler = [NSAssertionHandler currentHandler];
+  if (handler == nil || [NSAssertionHandler currentHandler] != handler)
+    return -1;
+  return 0;
+}
+
+int test_NSError() {
+  NSAutoreleasePool *pool = [NSAutoreleasePool new];
+  NSString *domain = [NSString stringWithUTF8String:"TestDomain"];
+  NSDictionary *info = [NSDictionary
+      dictionaryWithObjects:[NSArray arrayWithObjects:domain, nil]
+                    forKeys:[NSArray arrayWithObjects:domain, nil]];
+  NSError *error = [NSError errorWithDomain:domain code:42 userInfo:info];
+  int res = 0;
+  if (![[error domain] isEqualToString:domain] || [error code] != 42 ||
+      ![[error userInfo] isEqual:info])
+    res = -1;
+  [pool drain];
+  return res;
+}
+
+@interface URLConnectionDelegate : NSObject {
+@public
+  int failures;
+  NSInteger code;
+}
+@end
+
+@implementation URLConnectionDelegate
+- (void)connection:(NSURLConnection *)connection
+    didFailWithError:(NSError *)error {
+  failures++;
+  code = [error code];
+}
+@end
+
+#ifndef DEFINE_ME_WHEN_BUILDING_ON_MACOS
+// A background thread, since the main thread's run loop needs a window.
+void *url_connection_pthread(void *arg) {
+  NSAutoreleasePool *pool = [NSAutoreleasePool new];
+  int *res = arg;
+  NSURLRequest *request = [NSURLRequest
+      requestWithURL:[NSURL
+                         URLWithString:[NSString stringWithUTF8String:
+                                                     "http://example.com/"]]];
+  NSMutableURLRequest *copy = [request mutableCopy];
+  if (request == nil || [copy class] != [NSMutableURLRequest class] ||
+      ![[copy URL] isEqual:[request URL]])
+    *res = -1;
+  [copy release];
+
+  // Without a network, the delegate hears of the failure from the run loop.
+  URLConnectionDelegate *delegate = [URLConnectionDelegate new];
+  NSURLConnection *connection =
+      [[NSURLConnection alloc] initWithRequest:request delegate:delegate];
+  if (*res == 0 && (connection == nil || delegate->failures != 0))
+    *res = -2;
+  NSRunLoop *runLoop = [NSRunLoop currentRunLoop];
+  [runLoop runMode:NSDefaultRunLoopMode
+        beforeDate:[NSDate dateWithTimeIntervalSinceNow:1]];
+  if (*res == 0 && (delegate->failures != 1 || delegate->code != -1009))
+    *res = -3;
+  [connection release];
+
+  // A cancelled connection tells its delegate nothing.
+  URLConnectionDelegate *delegate2 = [URLConnectionDelegate new];
+  connection = [[NSURLConnection alloc] initWithRequest:request
+                                               delegate:delegate2];
+  [connection cancel];
+  [runLoop runMode:NSDefaultRunLoopMode
+        beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+  if (*res == 0 && delegate2->failures != 0)
+    *res = -4;
+  [connection release];
+
+  [delegate release];
+  [delegate2 release];
+  [pool release];
+  return NULL;
+}
+#endif
+
+int test_NSURLConnection_offline() {
+#ifdef DEFINE_ME_WHEN_BUILDING_ON_MACOS
+  // On macOS, this would really go to the network.
+  return 0;
+#else
+  int res = 0;
+  pthread_t p;
+  if (pthread_create(&p, NULL, url_connection_pthread, &res) != 0 ||
+      pthread_join(p, NULL) != 0)
+    return -10;
+  return res;
+#endif
+}
+
+int test_NSNumber_objCType() {
+  // The type a number is stored as, not always the type it was made with.
+  struct {
+    NSNumber *number;
+    const char *type;
+  } cases[] = {
+      {[NSNumber numberWithBool:YES], "c"},
+      {[NSNumber numberWithShort:-2], "s"},
+      {[NSNumber numberWithInt:3], "i"},
+      {[NSNumber numberWithUnsignedInt:4], "q"},
+      {[NSNumber numberWithLongLong:5], "q"},
+      {[NSNumber numberWithFloat:1.5], "f"},
+      {[NSNumber numberWithDouble:2.5], "d"},
+  };
+  for (int i = 0; i < (int)(sizeof(cases) / sizeof(cases[0])); i++) {
+    if (strcmp([cases[i].number objCType], cases[i].type) != 0)
+      return -1 - i;
+  }
+  return 0;
+}
+
+int test_valueForKey() {
+  NSAutoreleasePool *pool = [NSAutoreleasePool new];
+  KVCGetterTest *obj = [KVCGetterTest new];
+  NSString *count = [NSString stringWithUTF8String:"count"];
+  NSString *ratio = [NSString stringWithUTF8String:"ratio"];
+  NSString *enabled = [NSString stringWithUTF8String:"enabled"];
+  NSString *name = [NSString stringWithUTF8String:"name"];
+  int res = 0;
+
+  // An accessor comes before the ivar of the same name.
+  if ([[obj valueForKey:count] intValue] != 7)
+    res = -1;
+  // Then an ivar, wrapped in an NSNumber.
+  else if ([[obj valueForKey:ratio] floatValue] != 1.5)
+    res = -2;
+  // is<Key> accessors.
+  else if (![[obj valueForKey:enabled] boolValue])
+    res = -3;
+  else if ([obj valueForKey:name] != nil)
+    res = -4;
+
+  // Missing values are NSNull.
+  NSDictionary *dict = [obj
+      dictionaryWithValuesForKeys:[NSArray arrayWithObjects:count, name, nil]];
+  if (res == 0 &&
+      ([dict count] != 2 || [[dict objectForKey:count] intValue] != 7 ||
+       [dict objectForKey:name] != [NSNull null]))
+    res = -5;
+
+  [obj release];
+  [pool drain];
+  return res;
+}
+
+int test_NSString_ranges_and_encodings() {
+  NSAutoreleasePool *pool = [NSAutoreleasePool new];
+  int res = 0;
+  NSString *s = [NSString stringWithUTF8String:"abcABCabc"];
+  NSString *abc = [NSString stringWithUTF8String:"abc"];
+  NSRange all = NSMakeRange(0, 9);
+  NSRange r;
+  // Only matches inside the range count.
+  r = [s rangeOfString:abc options:0 range:NSMakeRange(1, 8)];
+  if (r.location != 6 || r.length != 3)
+    res = -1;
+  r = [s rangeOfString:abc
+               options:NSCaseInsensitiveSearch
+                 range:NSMakeRange(1, 8)];
+  if (res == 0 && r.location != 3)
+    res = -2;
+  r = [s rangeOfString:abc
+               options:NSBackwardsSearch | NSCaseInsensitiveSearch
+                 range:NSMakeRange(0, 8)];
+  if (res == 0 && r.location != 3)
+    res = -3;
+  r = [s rangeOfString:abc options:NSAnchoredSearch range:NSMakeRange(1, 8)];
+  if (res == 0 && r.location != NSNotFound)
+    res = -4;
+  r = [s rangeOfString:abc
+               options:NSAnchoredSearch | NSBackwardsSearch
+                 range:all];
+  if (res == 0 && r.location != 6)
+    res = -5;
+
+  // "héllo": é is two bytes in UTF-8, one in Latin-1, none in ASCII.
+  NSString *h = [NSString stringWithUTF8String:"h\xc3\xa9llo"];
+  if (res == 0 && ([h canBeConvertedToEncoding:1 /* ASCII */] ||
+                   ![h canBeConvertedToEncoding:5 /* ISO Latin 1 */] ||
+                   ![h canBeConvertedToEncoding:4 /* UTF-8 */]))
+    res = -6;
+  char buf[8] = {0};
+  NSUInteger used = 0;
+  NSRange left;
+  // Only whole characters fit.
+  BOOL ok = [h getBytes:buf
+              maxLength:2
+             usedLength:&used
+               encoding:4
+                options:0
+                  range:NSMakeRange(0, 5)
+         remainingRange:&left];
+  if (res == 0 && (!ok || used != 1 || buf[0] != 'h' || left.location != 1 ||
+                   left.length != 4))
+    res = -7;
+  // It stops at a character the encoding can't hold.
+  ok = [h getBytes:buf
+           maxLength:8
+          usedLength:&used
+            encoding:1
+             options:0
+               range:NSMakeRange(0, 5)
+      remainingRange:&left];
+  if (res == 0 && (!ok || used != 1 || left.location != 1))
+    res = -8;
+  // Without a buffer, it measures.
+  ok = [h getBytes:NULL
+           maxLength:0
+          usedLength:&used
+            encoding:4
+             options:0
+               range:NSMakeRange(0, 5)
+      remainingRange:NULL];
+  if (res == 0 && (!ok || used != 6))
+    res = -9;
+
+  NSMutableString *m = [NSMutableString stringWithCapacity:16];
+  [m appendString:[NSString stringWithUTF8String:"hello world"]];
+  [m replaceCharactersInRange:NSMakeRange(6, 5)
+                   withString:[NSString stringWithUTF8String:"there"]];
+  if (res == 0 &&
+      ![m isEqualToString:[NSString stringWithUTF8String:"hello there"]])
+    res = -10;
+  [pool drain];
+  return res;
+}
+
+int test_NSData_description() {
+  NSAutoreleasePool *pool = [NSAutoreleasePool new];
+  int res = 0;
+  NSData *data = [NSData dataWithBytes:"\x01\xabHello" length:7];
+  // The iPhone OS format. macOS 10.15 and later use a different one.
+#ifdef DEFINE_ME_WHEN_BUILDING_ON_MACOS
+  if ([data description] == nil)
+    res = -1;
+#else
+  if (![[data description]
+          isEqualToString:[NSString stringWithUTF8String:"<01ab4865 6c6c6f>"]])
+    res = -1;
+  NSData *empty = [NSData dataWithBytes:"" length:0];
+  if (![[empty description]
+          isEqualToString:[NSString stringWithUTF8String:"<>"]])
+    res = -2;
+#endif
+  [pool drain];
+  return res;
+}
+
 int test_CC_SHA256() {
   // SHA-256 of "hello world"
   const unsigned char expected[CC_SHA256_DIGEST_LENGTH] = {
@@ -699,6 +1114,128 @@ int test_CC_SHA256() {
   CC_SHA256_Update(&ctx, data + 71, 129);
   CC_SHA256_Final(md, &ctx);
   if (memcmp(md, oneshot, sizeof(md)) != 0)
+    return -4;
+
+  return 0;
+}
+
+int test_CCCrypt() {
+  const unsigned char key[32] = {
+      0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a,
+      0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15,
+      0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f};
+  unsigned char out[48];
+  size_t moved = 0;
+
+  // FIPS-197 AES-128 example, ECB without padding.
+  const unsigned char plain[16] = {0x00, 0x11, 0x22, 0x33, 0x44, 0x55,
+                                   0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb,
+                                   0xcc, 0xdd, 0xee, 0xff};
+  const unsigned char ecb128[16] = {0x69, 0xc4, 0xe0, 0xd8, 0x6a, 0x7b,
+                                    0x04, 0x30, 0xd8, 0xcd, 0xb7, 0x80,
+                                    0x70, 0xb4, 0xc5, 0x5a};
+  if (CCCrypt(kCCEncrypt, kCCAlgorithmAES128, kCCOptionECBMode, key, 16, NULL,
+              plain, 16, out, sizeof(out), &moved) != kCCSuccess ||
+      moved != 16 || memcmp(out, ecb128, 16) != 0)
+    return -1;
+  if (CCCrypt(kCCDecrypt, kCCAlgorithmAES128, kCCOptionECBMode, key, 16, NULL,
+              ecb128, 16, out, sizeof(out), &moved) != kCCSuccess ||
+      moved != 16 || memcmp(out, plain, 16) != 0)
+    return -2;
+
+  // FIPS-197 AES-256 example.
+  const unsigned char ecb256[16] = {0x8e, 0xa2, 0xb7, 0xca, 0x51, 0x67,
+                                    0x45, 0xbf, 0xea, 0xfc, 0x49, 0x90,
+                                    0x4b, 0x49, 0x60, 0x89};
+  if (CCCrypt(kCCEncrypt, kCCAlgorithmAES128, kCCOptionECBMode, key, 32, NULL,
+              plain, 16, out, sizeof(out), &moved) != kCCSuccess ||
+      moved != 16 || memcmp(out, ecb256, 16) != 0)
+    return -3;
+
+  // CBC with PKCS7 padding and an IV.
+  const unsigned char iv[16] = {0x0f, 0x0e, 0x0d, 0x0c, 0x0b, 0x0a, 0x09, 0x08,
+                                0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00};
+  const unsigned char cbc[16] = {0x3f, 0xb5, 0x1c, 0x0c, 0xcb, 0xcb,
+                                 0x53, 0x3b, 0xb8, 0x2a, 0x08, 0xe6,
+                                 0x81, 0x70, 0x13, 0xea};
+  if (CCCrypt(kCCEncrypt, kCCAlgorithmAES128, kCCOptionPKCS7Padding, key, 16,
+              iv, "hello world", 11, out, sizeof(out), &moved) != kCCSuccess ||
+      moved != 16 || memcmp(out, cbc, 16) != 0)
+    return -4;
+  // Decrypted in place.
+  if (CCCrypt(kCCDecrypt, kCCAlgorithmAES128, kCCOptionPKCS7Padding, key, 16,
+              iv, out, 16, out, sizeof(out), &moved) != kCCSuccess ||
+      moved != 11 || memcmp(out, "hello world", 11) != 0)
+    return -5;
+
+  // A whole block of input gets a whole block of padding. Without an
+  // IV, CBC uses one of all zeroes.
+  const unsigned char cbc256[32] = {
+      0xd8, 0xc9, 0x57, 0x58, 0xe3, 0x35, 0x3e, 0x53, 0x0f, 0xa5, 0x2b,
+      0xd1, 0x0e, 0x73, 0xb9, 0x86, 0x4f, 0x6b, 0xa3, 0x02, 0x22, 0x07,
+      0x4c, 0x4d, 0x47, 0x7c, 0x3f, 0x29, 0x4f, 0x12, 0xa8, 0x2f};
+  if (CCCrypt(kCCEncrypt, kCCAlgorithmAES128, kCCOptionPKCS7Padding, key, 32,
+              NULL, "0123456789abcdef", 16, out, sizeof(out),
+              &moved) != kCCSuccess ||
+      moved != 32 || memcmp(out, cbc256, 32) != 0)
+    return -6;
+
+  // Too small an output buffer says how much is needed.
+  moved = 0;
+  if (CCCrypt(kCCEncrypt, kCCAlgorithmAES128, kCCOptionPKCS7Padding, key, 16,
+              iv, "hello world", 11, out, 15, &moved) != kCCBufferTooSmall ||
+      moved != 16)
+    return -7;
+
+  // Without padding, the input must be whole blocks.
+  if (CCCrypt(kCCEncrypt, kCCAlgorithmAES128, 0, key, 16, iv, "hello world", 11,
+              out, sizeof(out), &moved) != kCCAlignmentError)
+    return -8;
+
+  // AES has no 20-byte keys.
+  if (CCCrypt(kCCEncrypt, kCCAlgorithmAES128, 0, key, 20, iv, plain, 16, out,
+              sizeof(out), &moved) == kCCSuccess)
+    return -9;
+
+  return 0;
+}
+
+int test_CCHmac() {
+  const char *key = "key";
+  const char *data = "The quick brown fox jumps over the lazy dog";
+  unsigned char mac[64];
+
+  const unsigned char sha1[20] = {0xde, 0x7c, 0x9b, 0x85, 0xb8, 0xb7, 0x8a,
+                                  0xa6, 0xbc, 0x8a, 0x7a, 0x36, 0xf7, 0x0a,
+                                  0x90, 0x70, 0x1c, 0x9d, 0xb4, 0xd9};
+  CCHmac(kCCHmacAlgSHA1, key, 3, data, strlen(data), mac);
+  if (memcmp(mac, sha1, sizeof(sha1)) != 0)
+    return -1;
+
+  const unsigned char md5[16] = {0x80, 0x07, 0x07, 0x13, 0x46, 0x3e,
+                                 0x77, 0x49, 0xb9, 0x0c, 0x2d, 0xc2,
+                                 0x49, 0x11, 0xe2, 0x75};
+  CCHmac(kCCHmacAlgMD5, key, 3, data, strlen(data), mac);
+  if (memcmp(mac, md5, sizeof(md5)) != 0)
+    return -2;
+
+  const unsigned char sha256[32] = {
+      0xf7, 0xbc, 0x83, 0xf4, 0x30, 0x53, 0x84, 0x24, 0xb1, 0x32, 0x98,
+      0xe6, 0xaa, 0x6f, 0xb1, 0x43, 0xef, 0x4d, 0x59, 0xa1, 0x49, 0x46,
+      0x17, 0x59, 0x97, 0x47, 0x9d, 0xbc, 0x2d, 0x1a, 0x3c, 0xd8};
+  CCHmac(kCCHmacAlgSHA256, key, 3, data, strlen(data), mac);
+  if (memcmp(mac, sha256, sizeof(sha256)) != 0)
+    return -3;
+
+  const unsigned char sha512[64] = {
+      0xb4, 0x2a, 0xf0, 0x90, 0x57, 0xba, 0xc1, 0xe2, 0xd4, 0x17, 0x08,
+      0xe4, 0x8a, 0x90, 0x2e, 0x09, 0xb5, 0xff, 0x7f, 0x12, 0xab, 0x42,
+      0x8a, 0x4f, 0xe8, 0x66, 0x53, 0xc7, 0x3d, 0xd2, 0x48, 0xfb, 0x82,
+      0xf9, 0x48, 0xa5, 0x49, 0xf7, 0xb7, 0x91, 0xa5, 0xb4, 0x19, 0x15,
+      0xee, 0x4d, 0x1e, 0xc3, 0x93, 0x53, 0x57, 0xe4, 0xe2, 0x31, 0x72,
+      0x50, 0xd0, 0x37, 0x2a, 0xfa, 0x2e, 0xbe, 0xeb, 0x3a};
+  CCHmac(kCCHmacAlgSHA512, key, 3, data, strlen(data), mac);
+  if (memcmp(mac, sha512, sizeof(sha512)) != 0)
     return -4;
 
   return 0;
@@ -1363,6 +1900,93 @@ int test_strtol() {
     if (res2[i] != l) {
       return -(count + 2 + i + 1);
     }
+  }
+  return 0;
+}
+
+int test_mktemp() {
+  char name[] = "/usr/tmpXXXXXX";
+  char *res = mktemp(name);
+  if (res != name || strncmp(name, "/usr/tmp", 8) != 0 || strlen(name) != 14 ||
+      strcmp(name + 8, "XXXXXX") == 0) {
+    return -1;
+  }
+  for (int i = 8; i < 14; i++) {
+    char c = name[i];
+    if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+          (c >= '0' && c <= '9'))) {
+      return -2;
+    }
+  }
+  // Only mkstemp() needs the folder to exist.
+  char missing[] = "/does/not/existXXXXXX";
+  if (mktemp(missing) != missing || strcmp(missing + 15, "XXXXXX") == 0) {
+    return -3;
+  }
+  // With no X's, it can only be the name given, which here is taken.
+  char taken[] = "/usr";
+  if (mktemp(taken) != NULL || errno != EEXIST) {
+    return -4;
+  }
+  return 0;
+}
+
+int test_basename() {
+  const char *cases[][2] = {
+      {"/a/b/c", "c"}, {"/a/b/", "b"}, {"c", "c"},
+      {"/", "/"},      {"///", "/"},   {"", "."},
+  };
+  for (int i = 0; i < (int)(sizeof(cases) / sizeof(cases[0])); i++) {
+    char path[16];
+    strcpy(path, cases[i][0]);
+    if (strcmp(basename(path), cases[i][1]) != 0) {
+      return -(i + 1);
+    }
+  }
+  if (strcmp(basename(NULL), ".") != 0) {
+    return -10;
+  }
+  return 0;
+}
+
+int test_getpeername() {
+  struct sockaddr_in addr;
+  socklen_t len = sizeof(addr);
+  if (getpeername(1000, (struct sockaddr *)&addr, &len) != -1 ||
+      errno != EBADF) {
+    return -1;
+  }
+  // A UDP socket with no connect() has no peer.
+  int s = socket(AF_INET, SOCK_DGRAM, 0);
+  if (s < 0) {
+    return -2;
+  }
+  int res = getpeername(s, (struct sockaddr *)&addr, &len);
+  int err = errno;
+  close(s);
+  if (res != -1 || err != ENOTCONN) {
+    return -3;
+  }
+  return 0;
+}
+
+int test_strtoll() {
+  const char *p = "8589934592 -8589934592 99999999999999999999 7x";
+  long long res[] = {8589934592LL, -8589934592LL, 9223372036854775807LL, 7};
+  int count = sizeof(res) / sizeof(long long);
+  for (int i = 0; i < count; i++) {
+    char *endp = NULL;
+    long long l = strtoll(p, &endp, 10);
+    if (p == endp || res[i] != l) {
+      return -(i + 1);
+    }
+    p = endp;
+  }
+  if (*p != 'x') {
+    return -(count + 1);
+  }
+  if (strtoll("0x1ffffffff", NULL, 0) != 0x1ffffffffLL) {
+    return -(count + 2);
   }
   return 0;
 }
@@ -2438,6 +3062,376 @@ int test_NSThread_isExecuting_isFinished() {
   if (pthread_result != 0)
     return -7;
 
+  return 0;
+}
+
+int test_NSPort() {
+  NSAutoreleasePool *pool = [NSAutoreleasePool new];
+  int res = 0;
+
+  // NSPort is abstract, so it makes an NSMachPort.
+  NSPort *port = [NSPort port];
+  if ([port class] != [NSMachPort class])
+    res = -1;
+
+  // The run loop keeps its ports.
+  NSMachPort *machPort = [NSMachPort port];
+  NSRunLoop *runLoop = [NSRunLoop currentRunLoop];
+  NSUInteger before = [machPort retainCount];
+  [runLoop addPort:machPort forMode:NSDefaultRunLoopMode];
+  NSUInteger added = [machPort retainCount];
+  if (res == 0 && added <= before)
+    res = -2;
+  [runLoop removePort:machPort forMode:NSDefaultRunLoopMode];
+  if (res == 0 && [machPort retainCount] >= added)
+    res = -3;
+
+  [pool drain];
+  return res;
+}
+
+@interface RunModeTarget : NSObject {
+@public
+  int ran;
+}
+- (void)ping;
+@end
+
+@implementation RunModeTarget
+- (void)ping {
+  ran = 1;
+}
+@end
+
+void *run_mode_pthread(void *arg) {
+  NSAutoreleasePool *pool = [NSAutoreleasePool new];
+  int *res = arg;
+  NSRunLoop *runLoop = [NSRunLoop currentRunLoop];
+  NSDate *start = [NSDate date];
+
+  // With nothing attached, it can't run.
+  if ([runLoop runMode:NSDefaultRunLoopMode beforeDate:[NSDate distantFuture]])
+    *res = -1;
+
+  // A port keeps it running until the date.
+  [runLoop addPort:[NSMachPort port] forMode:NSDefaultRunLoopMode];
+  if (*res == 0 &&
+      ![runLoop runMode:NSDefaultRunLoopMode
+             beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.05]])
+    *res = -2;
+
+  // A performed selector is an input source: it returns once that has run,
+  // well before the date.
+  RunModeTarget *target = [RunModeTarget new];
+  [target performSelector:@selector(ping)
+                 onThread:[NSThread currentThread]
+               withObject:nil
+            waitUntilDone:NO];
+  if (*res == 0 &&
+      (![runLoop runMode:NSDefaultRunLoopMode
+              beforeDate:[NSDate dateWithTimeIntervalSinceNow:10]] ||
+       !target->ran))
+    *res = -3;
+  if (*res == 0 && [[NSDate date] timeIntervalSinceReferenceDate] -
+                           [start timeIntervalSinceReferenceDate] >
+                       5)
+    *res = -4;
+
+  [target release];
+  [pool release];
+  return NULL;
+}
+
+int test_NSRunLoop_runMode() {
+  int res = 0;
+  pthread_t p;
+  if (pthread_create(&p, NULL, run_mode_pthread, &res) != 0 ||
+      pthread_join(p, NULL) != 0)
+    return -10;
+  return res;
+}
+
+// For test_Foundation_small_gaps.
+static NSCondition *g_condition;
+static volatile int g_condition_flag;
+void *condition_signal_pthread(void *arg) {
+  [g_condition lock];
+  g_condition_flag = 1;
+  [g_condition signal];
+  [g_condition unlock];
+  return NULL;
+}
+void *cancel_perform_pthread(void *arg) {
+  NSAutoreleasePool *pool = [NSAutoreleasePool new];
+  RunModeTarget *target = [RunModeTarget new];
+  [target performSelector:@selector(ping) withObject:nil afterDelay:0];
+  [NSObject cancelPreviousPerformRequestsWithTarget:target];
+  [[NSRunLoop currentRunLoop]
+         runMode:NSDefaultRunLoopMode
+      beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+  *(int *)arg = target->ran;
+  [target release];
+  [pool release];
+  return NULL;
+}
+
+int test_Foundation_small_gaps() {
+  NSAutoreleasePool *pool = [NSAutoreleasePool new];
+  int res = 0;
+
+  NSString *a = [NSString stringWithUTF8String:"a"];
+  NSString *b = [NSString stringWithUTF8String:"b"];
+  NSString *c = [NSString stringWithUTF8String:"c"];
+  NSMutableDictionary *dict = [NSMutableDictionary new];
+  [dict setObject:a forKey:a];
+  [dict setObject:b forKey:b];
+  [dict removeObjectsForKeys:[NSArray arrayWithObjects:a, c, nil]];
+  if ([dict count] != 1 || [dict objectForKey:b] != b)
+    res = -1;
+  [dict release];
+
+  NSFileManager *fm = [NSFileManager defaultManager];
+  if (res == 0 &&
+      (![fm isExecutableFileAtPath:NSHomeDirectory()] ||
+       [fm isExecutableFileAtPath:[NSString
+                                      stringWithUTF8String:"/does/not/exist"]]))
+    res = -2;
+
+  NSTimeZone *tz = [NSTimeZone timeZoneForSecondsFromGMT:5400];
+  if (res == 0 &&
+      ([tz secondsFromGMT] != 5400 ||
+       ![[tz name] isEqualToString:[NSString stringWithUTF8String:"GMT+0130"]]))
+    res = -3;
+
+  if (res == 0 && strcmp(sel_getName(@selector(count)), "count") != 0)
+    res = -4;
+
+  // A cancelled request never runs.
+  int ran = -1;
+  pthread_t p;
+  if (res == 0 &&
+      (pthread_create(&p, NULL, cancel_perform_pthread, &ran) != 0 ||
+       pthread_join(p, NULL) != 0 || ran != 0))
+    res = -5;
+
+  // Waiting times out without a signal, and wakes with one.
+  g_condition = [NSCondition new];
+  [g_condition lock];
+  if (res == 0 &&
+      [g_condition waitUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]])
+    res = -6;
+  g_condition_flag = 0;
+  if (res == 0 && pthread_create(&p, NULL, condition_signal_pthread, NULL) != 0)
+    res = -7;
+  while (res == 0 && !g_condition_flag)
+    [g_condition wait];
+  [g_condition unlock];
+  if (res == 0)
+    pthread_join(p, NULL);
+  [g_condition release];
+
+  [pool drain];
+  return res;
+}
+
+int test_NSCalendar() {
+  NSCalendar *calendar =
+      [[NSCalendar alloc] initWithCalendarIdentifier:NSGregorianCalendar];
+  [calendar
+      setTimeZone:[NSTimeZone
+                      timeZoneWithName:[NSString stringWithUTF8String:"GMT"]]];
+
+  // 2026-11-03 12:34:56, a Tuesday.
+  NSDateComponents *components = [[NSDateComponents alloc] init];
+  [components setYear:2026];
+  [components setMonth:11];
+  [components setDay:3];
+  [components setHour:12];
+  [components setMinute:34];
+  [components setSecond:56];
+  NSDate *date = [calendar dateFromComponents:components];
+  [components release];
+  if ([date timeIntervalSinceReferenceDate] != 815402096)
+    return -1;
+  NSUInteger units = NSYearCalendarUnit | NSMonthCalendarUnit |
+                     NSDayCalendarUnit | NSHourCalendarUnit |
+                     NSMinuteCalendarUnit | NSSecondCalendarUnit |
+                     NSWeekdayCalendarUnit;
+  components = [calendar components:units fromDate:date];
+  if ([components year] != 2026 || [components month] != 11 ||
+      [components day] != 3 || [components hour] != 12 ||
+      [components minute] != 34 || [components second] != 56 ||
+      [components weekday] != 3)
+    return -2;
+
+  // A month after January 31 is the end of February.
+  NSDate *jan31 = [NSDate dateWithTimeIntervalSinceReferenceDate:791510400];
+  NSDateComponents *month = [[NSDateComponents alloc] init];
+  [month setMonth:1];
+  NSDate *feb28 = [calendar dateByAddingComponents:month
+                                            toDate:jan31
+                                           options:0];
+  [month release];
+  if ([feb28 timeIntervalSinceReferenceDate] != 793929600)
+    return -3;
+
+  // From January 31 to March 1 is a month and a day.
+  NSDate *mar1 = [NSDate dateWithTimeIntervalSinceReferenceDate:794016000];
+  components = [calendar components:NSMonthCalendarUnit | NSDayCalendarUnit
+                           fromDate:jan31
+                             toDate:mar1
+                            options:0];
+  if ([components month] != 1 || [components day] != 1)
+    return -4;
+
+  // After 2038.
+  NSDate *later = [NSDate dateWithTimeIntervalSinceReferenceDate:1245024000];
+  components = [calendar components:units fromDate:later];
+  if ([components year] != 2040 || [components month] != 6 ||
+      [components day] != 15)
+    return -5;
+
+  [calendar release];
+  return 0;
+}
+
+static int operation_log[8];
+static volatile int operation_log_count;
+
+@interface LoggingOperation : NSOperation {
+@public
+  int tag;
+}
+@end
+@implementation LoggingOperation
+- (void)main {
+  operation_log[operation_log_count++] = tag;
+}
+@end
+
+// Runs itself on its own thread, as concurrent operations do.
+@interface ConcurrentOperation : NSOperation {
+  BOOL executing;
+  BOOL finished;
+}
+@end
+@implementation ConcurrentOperation
+- (BOOL)isConcurrent {
+  return YES;
+}
+- (BOOL)isExecuting {
+  return executing;
+}
+- (BOOL)isFinished {
+  return finished;
+}
+- (void)start {
+  NSString *key = [NSString stringWithUTF8String:"isExecuting"];
+  [self willChangeValueForKey:key];
+  executing = YES;
+  [self didChangeValueForKey:key];
+  NSThread *thread = [[NSThread alloc] initWithTarget:self
+                                             selector:@selector(work:)
+                                               object:nil];
+  [thread start];
+  [thread release];
+}
+- (void)work:(id)unused {
+  NSAutoreleasePool *pool = [NSAutoreleasePool new];
+  usleep(10000);
+  operation_log[operation_log_count++] = 9;
+  NSString *executing_key = [NSString stringWithUTF8String:"isExecuting"];
+  NSString *finished_key = [NSString stringWithUTF8String:"isFinished"];
+  [self willChangeValueForKey:executing_key];
+  [self willChangeValueForKey:finished_key];
+  executing = NO;
+  finished = YES;
+  [self didChangeValueForKey:executing_key];
+  [self didChangeValueForKey:finished_key];
+  [pool release];
+}
+@end
+
+@interface InvocationOperationTarget : NSObject
+- (void)log:(id)object;
+@end
+@implementation InvocationOperationTarget
+- (void)log:(id)object {
+  operation_log[operation_log_count++] = object == nil ? 7 : 8;
+}
+@end
+
+int test_NSOperationQueue() {
+  NSOperationQueue *queue = [NSOperationQueue new];
+  [queue setMaxConcurrentOperationCount:1];
+
+  // b waits for c, added after it; d is cancelled, so it never runs.
+  operation_log_count = 0;
+  LoggingOperation *a = [LoggingOperation new];
+  LoggingOperation *b = [LoggingOperation new];
+  LoggingOperation *c = [LoggingOperation new];
+  LoggingOperation *d = [LoggingOperation new];
+  a->tag = 1;
+  b->tag = 2;
+  c->tag = 3;
+  d->tag = 4;
+  [b addDependency:c];
+  [d cancel];
+  [queue addOperation:a];
+  [queue addOperation:b];
+  [queue addOperation:c];
+  [queue addOperation:d];
+  [queue waitUntilAllOperationsAreFinished];
+  if (operation_log_count != 3)
+    return -1;
+  int b_index = -1, c_index = -1;
+  for (int i = 0; i < 3; i++) {
+    if (operation_log[i] == 2)
+      b_index = i;
+    if (operation_log[i] == 3)
+      c_index = i;
+  }
+  if (c_index < 0 || b_index < c_index)
+    return -2;
+  if (![d isFinished] || ![d isCancelled] || [queue operationCount] != 0)
+    return -3;
+  if (![a isFinished] || [a isExecuting] || [a isConcurrent])
+    return -4;
+
+  // A concurrent operation, finishing on its own thread.
+  operation_log_count = 0;
+  ConcurrentOperation *e = [ConcurrentOperation new];
+  [queue addOperation:e];
+  [queue waitUntilAllOperationsAreFinished];
+  if (operation_log_count != 1 || operation_log[0] != 9 || ![e isFinished])
+    return -5;
+
+  // NSInvocationOperation, without and with an object.
+  operation_log_count = 0;
+  InvocationOperationTarget *target = [InvocationOperationTarget new];
+  NSInvocationOperation *f =
+      [[NSInvocationOperation alloc] initWithTarget:target
+                                           selector:@selector(log:)
+                                             object:nil];
+  NSInvocationOperation *g =
+      [[NSInvocationOperation alloc] initWithTarget:target
+                                           selector:@selector(log:)
+                                             object:target];
+  [queue addOperation:f];
+  [queue addOperation:g];
+  [queue waitUntilAllOperationsAreFinished];
+  if (operation_log_count != 2 || operation_log[0] + operation_log[1] != 15)
+    return -6;
+
+  [a release];
+  [b release];
+  [c release];
+  [d release];
+  [e release];
+  [f release];
+  [g release];
+  [target release];
+  [queue release];
   return 0;
 }
 
@@ -3905,6 +4899,280 @@ int test_close() {
   if (close(1000) == 0)
     return -3;
   return 0;
+}
+
+// Counts the objects fast enumeration gives, as a for-in loop would.
+static int count_by_fast_enumeration(id collection) {
+  NSFastEnumerationState state = {0};
+  id buffer[4];
+  int total = 0;
+  NSUInteger n;
+  while ((n = [collection countByEnumeratingWithState:&state
+                                              objects:buffer
+                                                count:4]))
+    total += n;
+  return total;
+}
+
+// A subclass, as games make, with its own storage.
+@interface CustomDictionary : NSDictionary {
+  NSDictionary *_backing;
+}
+@end
+
+@implementation CustomDictionary
+- (instancetype)init {
+  if ((self = [super init])) {
+    NSString *key = [NSString stringWithUTF8String:"key"];
+    NSString *value = [NSString stringWithUTF8String:"value"];
+    _backing = [[NSDictionary
+        dictionaryWithObjects:[NSArray arrayWithObjects:value, nil]
+                      forKeys:[NSArray arrayWithObjects:key, nil]] retain];
+  }
+  return self;
+}
+- (NSUInteger)count {
+  return [_backing count];
+}
+- (id)objectForKey:(id)key {
+  return [_backing objectForKey:key];
+}
+- (id)keyEnumerator {
+  return [_backing keyEnumerator];
+}
+- (void)dealloc {
+  [_backing release];
+  [super dealloc];
+}
+@end
+
+int test_NSDictionary_subclass() {
+  NSAutoreleasePool *pool = [NSAutoreleasePool new];
+  CustomDictionary *dict = [[CustomDictionary alloc] init];
+  NSString *key = [NSString stringWithUTF8String:"key"];
+  NSString *value = [NSString stringWithUTF8String:"value"];
+  int res = 0;
+  if ([dict class] != [CustomDictionary class])
+    res = -1;
+  else if ([dict count] != 1 || ![[dict objectForKey:key] isEqual:value])
+    res = -2;
+  // Inherited methods use the subclass's own storage.
+  else if (![[dict valueForKey:key] isEqual:value])
+    res = -3;
+  else if ([[dict allKeys] count] != 1 ||
+           ![[[dict allValues] objectAtIndex:0] isEqual:value] ||
+           ![[[dict objectEnumerator] nextObject] isEqual:value] ||
+           count_by_fast_enumeration(dict) != 1 || [dict description] == nil)
+    res = -4;
+  [dict release];
+  [pool drain];
+  return res;
+}
+
+@interface CustomArray : NSArray {
+  id _items[2];
+}
+@end
+
+@implementation CustomArray
+- (instancetype)init {
+  if ((self = [super init])) {
+    _items[0] = [[NSString stringWithUTF8String:"a"] retain];
+    _items[1] = [[NSString stringWithUTF8String:"b"] retain];
+  }
+  return self;
+}
+- (NSUInteger)count {
+  return 2;
+}
+- (id)objectAtIndex:(NSUInteger)index {
+  return _items[index];
+}
+- (void)dealloc {
+  [_items[0] release];
+  [_items[1] release];
+  [super dealloc];
+}
+@end
+
+@interface CustomString : NSString
+@end
+
+@implementation CustomString
+- (NSUInteger)length {
+  return 5;
+}
+- (unsigned short)characterAtIndex:(NSUInteger)index {
+  return "a,b,c"[index];
+}
+@end
+
+@interface CustomSet : NSSet {
+  NSArray *_items;
+}
+@end
+
+@implementation CustomSet
+- (instancetype)init {
+  if ((self = [super init])) {
+    _items = [[NSArray
+        arrayWithObjects:[NSString stringWithUTF8String:"x"], nil] retain];
+  }
+  return self;
+}
+- (NSUInteger)count {
+  return [_items count];
+}
+- (id)member:(id)object {
+  return [_items containsObject:object] ? object : nil;
+}
+- (id)objectEnumerator {
+  return [_items objectEnumerator];
+}
+- (void)dealloc {
+  [_items release];
+  [super dealloc];
+}
+@end
+
+int test_NSSortDescriptor_selector() {
+  NSAutoreleasePool *pool = [NSAutoreleasePool new];
+  NSString *a = [NSString stringWithUTF8String:"a"];
+  NSString *b = [NSString stringWithUTF8String:"b"];
+  NSString *c = [NSString stringWithUTF8String:"C"];
+  NSString *key = [NSString stringWithUTF8String:"self"];
+  SEL sel = NSSelectorFromString(
+      [NSString stringWithUTF8String:"caseInsensitiveCompare:"]);
+  NSArray *array = [NSArray arrayWithObjects:b, a, c, nil];
+
+  // compare: would put "C" first.
+  NSSortDescriptor *descriptor = [NSSortDescriptor sortDescriptorWithKey:key
+                                                               ascending:YES
+                                                                selector:sel];
+  NSArray *sorted = [array
+      sortedArrayUsingDescriptors:[NSArray arrayWithObjects:descriptor, nil]];
+  int res = 0;
+  if ([descriptor selector] != sel ||
+      ![sorted isEqualToArray:[NSArray arrayWithObjects:a, b, c, nil]])
+    res = -1;
+
+  // Descending, made with init.
+  descriptor = [[NSSortDescriptor alloc] initWithKey:key
+                                           ascending:NO
+                                            selector:sel];
+  sorted = [array
+      sortedArrayUsingDescriptors:[NSArray arrayWithObjects:descriptor, nil]];
+  if (res == 0 &&
+      ![sorted isEqualToArray:[NSArray arrayWithObjects:c, b, a, nil]])
+    res = -2;
+  [descriptor release];
+  [pool drain];
+  return res;
+}
+
+int test_NSMutableSet_addObjectsFromArray() {
+  NSAutoreleasePool *pool = [NSAutoreleasePool new];
+  NSString *a = [NSString stringWithUTF8String:"a"];
+  NSString *b = [NSString stringWithUTF8String:"b"];
+  NSMutableSet *set = [NSMutableSet setWithCapacity:2];
+  // A set holds each object only once.
+  [set addObjectsFromArray:[NSArray arrayWithObjects:a, b, a, nil]];
+  int res = [set count] == 2 && [set containsObject:a] && [set containsObject:b]
+                ? 0
+                : -1;
+  [pool drain];
+  return res;
+}
+
+// Subclasses, as games make, with their own storage. Inherited methods must
+// work through their primitive methods.
+int test_class_cluster_subclasses() {
+  NSAutoreleasePool *pool = [NSAutoreleasePool new];
+  int res = 0;
+
+  CustomArray *array = [[CustomArray alloc] init];
+  if ([array class] != [CustomArray class] || [array count] != 2 ||
+      ![array containsObject:[NSString stringWithUTF8String:"b"]] ||
+      count_by_fast_enumeration(array) != 2 ||
+      ![[[array objectEnumerator] nextObject]
+          isEqual:[NSString stringWithUTF8String:"a"]])
+    res = -1;
+  [array release];
+
+  CustomString *string = [[CustomString alloc] init];
+  NSString *plain = [NSString stringWithUTF8String:"a,b,c"];
+  if (res == 0 &&
+      ([string class] != [CustomString class] ||
+       ![string isEqualToString:plain] || ![plain isEqualToString:string] ||
+       [plain compare:string options:0] != NSOrderedSame ||
+       strcmp([string UTF8String], "a,b,c") != 0 ||
+       [[string componentsSeparatedByString:[NSString stringWithUTF8String:","]]
+           count] != 3))
+    res = -2;
+  [string release];
+
+  CustomSet *set = [[CustomSet alloc] init];
+  if (res == 0 && ([set class] != [CustomSet class] || [set count] != 1 ||
+                   ![set containsObject:[NSString stringWithUTF8String:"x"]] ||
+                   [set containsObject:[NSString stringWithUTF8String:"y"]] ||
+                   [[set allObjects] count] != 1 || [set anyObject] == nil ||
+                   count_by_fast_enumeration(set) != 1))
+    res = -3;
+  [set release];
+
+  [pool drain];
+  return res;
+}
+
+int test_NSDictionary_values() {
+  NSAutoreleasePool *pool = [NSAutoreleasePool new];
+  NSString *a = [NSString stringWithUTF8String:"a"];
+  NSString *b = [NSString stringWithUTF8String:"b"];
+  NSString *c = [NSString stringWithUTF8String:"c"];
+  NSString *x = [NSString stringWithUTF8String:"x"];
+  NSString *y = [NSString stringWithUTF8String:"y"];
+  NSDictionary *dict = [NSDictionary
+      dictionaryWithObjects:[NSArray arrayWithObjects:x, y, x, nil]
+                    forKeys:[NSArray arrayWithObjects:a, b, c, nil]];
+
+  int res = 0;
+  NSArray *values = [dict allValues];
+  int xs = 0, ys = 0;
+  for (NSUInteger i = 0; i < [values count]; i++) {
+    id v = [values objectAtIndex:i];
+    xs += v == x;
+    ys += v == y;
+  }
+  if ([values count] != 3 || xs != 2 || ys != 1)
+    res = -1;
+
+  NSArray *keys = [dict allKeysForObject:x];
+  if (res == 0 && ([keys count] != 2 || [[dict allKeysForObject:b] count]))
+    res = -2;
+
+  int count = 0;
+  NSEnumerator *e = [dict objectEnumerator];
+  while ([e nextObject])
+    count++;
+  if (res == 0 && count != 3)
+    res = -3;
+
+  count = 0;
+  e = [dict keyEnumerator];
+  for (id key; (key = [e nextObject]);)
+    count += [dict objectForKey:key] != nil;
+  if (res == 0 && count != 3)
+    res = -4;
+
+  NSMutableDictionary *mutable = [NSMutableDictionary new];
+  [mutable setObject:x forKey:a];
+  e = [mutable keyEnumerator];
+  if (res == 0 && ([e nextObject] != a || [e nextObject]))
+    res = -5;
+  [mutable release];
+
+  [pool drain];
+  return res;
 }
 
 int test_CFMutableDictionary_NullCallbacks() {
@@ -5438,6 +6706,16 @@ int test_CFURLHasDirectoryPath() {
   return 0;
 }
 
+int test_NSMutableString_insertString_atIndex() {
+  NSMutableString *str = [NSMutableString stringWithUTF8String:"ac"];
+  [str insertString:[NSString stringWithUTF8String:"b"] atIndex:1];
+  [str insertString:[NSString stringWithUTF8String:">"] atIndex:0];
+  [str insertString:[NSString stringWithUTF8String:"<"] atIndex:4];
+  if (!CFEqual(str, [NSString stringWithUTF8String:">abc<"]))
+    return -1;
+  return 0;
+}
+
 int test_NSMutableString_deleteCharactersInRange() {
   NSAutoreleasePool *pool = [NSAutoreleasePool new];
   NSMutableString *str = [NSMutableString stringWithUTF8String:"abc"];
@@ -5648,6 +6926,258 @@ int test_NSString_stringByReplacingOccurrencesOfString_options_range() {
   }
 
   [pool drain];
+  return 0;
+}
+
+int test_CGLayer() {
+  uint8_t pixels[8 * 8 * 4];
+  memset(pixels, 0, sizeof(pixels));
+  CGColorSpaceRef rgb = CGColorSpaceCreateDeviceRGB();
+  CGContextRef c = CGBitmapContextCreate(pixels, 8, 8, 8, 8 * 4, rgb,
+                                         kCGImageAlphaPremultipliedLast);
+  CGLayerRef layer = CGLayerCreateWithContext(c, CGSizeMake(4, 4), NULL);
+  int res = 0;
+  CGSize size = CGLayerGetSize(layer);
+  CGContextRef lc = CGLayerGetContext(layer);
+  if (size.width != 4 || size.height != 4 || lc == NULL) {
+    res = -1;
+    goto done;
+  }
+  // A transparent layer draws nothing.
+  CGContextDrawLayerInRect(c, CGRectMake(0, 0, 8, 8), layer);
+  if (pixels[3] != 0) {
+    res = -2;
+    goto done;
+  }
+  // What's drawn in the layer is scaled to the rect.
+  CGContextSetRGBFillColor(lc, 0, 0, 1, 1);
+  CGContextFillRect(lc, CGRectMake(0, 0, 4, 4));
+  CGContextDrawLayerInRect(c, CGRectMake(2, 2, 4, 4), layer);
+  if (pixels[(3 * 8 + 3) * 4 + 2] != 255 ||
+      pixels[(3 * 8 + 3) * 4 + 3] != 255 || pixels[3] != 0) {
+    res = -3;
+    goto done;
+  }
+  // y = 0 is the bottom row, which is last in memory.
+  CGContextDrawLayerAtPoint(c, CGPointMake(0, 0), layer);
+  if (pixels[(7 * 8 + 0) * 4 + 2] != 255 || pixels[2] == 255) {
+    res = -4;
+    goto done;
+  }
+
+done:
+  CGLayerRelease(layer);
+  CGContextRelease(c);
+  CGColorSpaceRelease(rgb);
+  return res;
+}
+
+// Each clip rect is symmetric top to bottom, as in test_CGContext_paths.
+int test_CGContext_clip() {
+  uint8_t pixels[8 * 8 * 4];
+  CGColorSpaceRef rgb = CGColorSpaceCreateDeviceRGB();
+  CGContextRef c = CGBitmapContextCreate(pixels, 8, 8, 8, 8 * 4, rgb,
+                                         kCGImageAlphaPremultipliedLast);
+  CGRect all = CGRectMake(0, 0, 8, 8);
+  int res = 0;
+#define CLIP_RED(x, y) (pixels[((y) * 8 + (x)) * 4] == 255)
+#define CLIP_EMPTY(x, y) (pixels[((y) * 8 + (x)) * 4 + 3] == 0)
+
+  // One rect, undone by restoring the graphics state.
+  memset(pixels, 0, sizeof(pixels));
+  CGContextSetRGBFillColor(c, 1, 0, 0, 1);
+  CGContextSaveGState(c);
+  CGContextClipToRect(c, CGRectMake(2, 2, 4, 4));
+  CGContextFillRect(c, all);
+  if (!CLIP_RED(3, 3) || !CLIP_EMPTY(0, 0) || !CLIP_EMPTY(1, 3)) {
+    res = -1;
+    goto done;
+  }
+  CGContextRestoreGState(c);
+  CGContextFillRect(c, all);
+  if (!CLIP_RED(0, 0)) {
+    res = -2;
+    goto done;
+  }
+
+  // Several rects, with a gap between them.
+  memset(pixels, 0, sizeof(pixels));
+  CGContextSaveGState(c);
+  CGRect rects[2] = {CGRectMake(0, 0, 2, 8), CGRectMake(6, 0, 2, 8)};
+  CGContextClipToRects(c, rects, 2);
+  CGContextFillRect(c, all);
+  if (!CLIP_RED(1, 4) || !CLIP_RED(6, 4) || !CLIP_EMPTY(4, 4)) {
+    res = -3;
+    goto done;
+  }
+  CGContextRestoreGState(c);
+
+  // Clipping again narrows the clip.
+  memset(pixels, 0, sizeof(pixels));
+  CGContextSaveGState(c);
+  CGContextClipToRect(c, CGRectMake(0, 0, 4, 8));
+  CGContextClipToRect(c, CGRectMake(2, 0, 6, 8));
+  CGContextFillRect(c, all);
+  if (!CLIP_RED(3, 4) || !CLIP_EMPTY(1, 4) || !CLIP_EMPTY(5, 4)) {
+    res = -4;
+    goto done;
+  }
+  CGContextRestoreGState(c);
+
+done:
+#undef CLIP_RED
+#undef CLIP_EMPTY
+  CGContextRelease(c);
+  CGColorSpaceRelease(rgb);
+  return res;
+}
+
+// Each shape is symmetric top to bottom, so the result doesn't depend on
+// which way up the bitmap's rows are.
+int test_CGContext_paths() {
+  uint8_t pixels[8 * 8 * 4];
+  CGColorSpaceRef rgb = CGColorSpaceCreateDeviceRGB();
+  CGContextRef c = CGBitmapContextCreate(pixels, 8, 8, 8, 8 * 4, rgb,
+                                         kCGImageAlphaPremultipliedLast);
+#define PIXEL(x, y) (&pixels[((y) * 8 + (x)) * 4])
+#define IS(x, y, r, g, b, a)                                                   \
+  (PIXEL(x, y)[0] == (r) && PIXEL(x, y)[1] == (g) && PIXEL(x, y)[2] == (b) &&  \
+   PIXEL(x, y)[3] == (a))
+
+  // A filled rectangle.
+  memset(pixels, 0, sizeof(pixels));
+  CGContextSetRGBFillColor(c, 1, 0, 0, 1);
+  CGContextBeginPath(c);
+  CGContextAddRect(c, CGRectMake(2, 2, 4, 4));
+  CGContextFillPath(c);
+  if (!IS(3, 3, 255, 0, 0, 255) || !IS(0, 0, 0, 0, 0, 0))
+    return -1;
+
+  // A filled circle.
+  memset(pixels, 0, sizeof(pixels));
+  CGContextSetRGBFillColor(c, 0, 1, 0, 1);
+  CGContextAddEllipseInRect(c, CGRectMake(0, 0, 8, 8));
+  CGContextFillPath(c);
+  if (!IS(3, 3, 0, 255, 0, 255) || !IS(0, 0, 0, 0, 0, 0))
+    return -2;
+
+  // A rounded rectangle made of arcs, so round it's a circle: the corner
+  // pixels are wholly outside it.
+  memset(pixels, 0, sizeof(pixels));
+  CGContextMoveToPoint(c, 4, 0);
+  CGContextAddArcToPoint(c, 8, 0, 8, 8, 4);
+  CGContextAddArcToPoint(c, 8, 8, 0, 8, 4);
+  CGContextAddArcToPoint(c, 0, 8, 0, 0, 4);
+  CGContextAddArcToPoint(c, 0, 0, 8, 0, 4);
+  CGContextClosePath(c);
+  CGContextFillPath(c);
+  if (!IS(3, 3, 0, 255, 0, 255) || !IS(4, 1, 0, 255, 0, 255) ||
+      !IS(0, 0, 0, 0, 0, 0))
+    return -3;
+
+  // A line two pixels wide across the middle.
+  memset(pixels, 0, sizeof(pixels));
+  CGContextSetRGBStrokeColor(c, 0, 0, 1, 1);
+  CGContextSetLineWidth(c, 2);
+  CGPoint line[] = {{0, 4}, {8, 4}};
+  CGContextStrokeLineSegments(c, line, 2);
+  if (!IS(4, 3, 0, 0, 255, 255) || !IS(4, 4, 0, 0, 255, 255) ||
+      !IS(4, 1, 0, 0, 0, 0))
+    return -4;
+
+  // A gradient from black on the left to white on the right.
+  memset(pixels, 0, sizeof(pixels));
+  CGFloat components[] = {0, 0, 0, 1, 1, 1, 1, 1};
+  CGGradientRef gradient =
+      CGGradientCreateWithColorComponents(rgb, components, NULL, 2);
+  CGContextDrawLinearGradient(c, gradient, CGPointMake(0, 4), CGPointMake(8, 4),
+                              0);
+  CGGradientRelease(gradient);
+  if (PIXEL(0, 3)[0] > 64 || PIXEL(7, 3)[0] < 192 || PIXEL(7, 3)[3] != 255)
+    return -5;
+
+  // Clearing a rectangle.
+  CGContextSetRGBFillColor(c, 1, 0, 0, 1);
+  CGContextFillRect(c, CGRectMake(0, 0, 8, 8));
+  CGContextSetBlendMode(c, kCGBlendModeClear);
+  CGContextAddRect(c, CGRectMake(2, 2, 4, 4));
+  CGContextFillPath(c);
+  CGContextSetBlendMode(c, kCGBlendModeNormal);
+  if (!IS(3, 3, 0, 0, 0, 0) || !IS(0, 0, 255, 0, 0, 255))
+    return -7;
+#undef IS
+#undef PIXEL
+
+  CGContextRelease(c);
+  CGColorSpaceRelease(rgb);
+
+  CGColorRef color = CGColorCreateGenericRGB(0.25, 0.5, 0.75, 1);
+  const CGFloat *rgba = CGColorGetComponents(color);
+  if (CGColorGetNumberOfComponents(color) != 4 || rgba[0] != 0.25 ||
+      rgba[1] != 0.5 || rgba[2] != 0.75 || rgba[3] != 1)
+    return -6;
+  CGColorRelease(color);
+  return 0;
+}
+
+int test_NSURL_query() {
+  NSURL *url = [NSURL
+      URLWithString:[NSString
+                        stringWithUTF8String:"http://a.com/p?x=1&y=%20#f"]];
+  if (![[url query]
+          isEqualToString:[NSString stringWithUTF8String:"x=1&y=%20"]])
+    return -1;
+  url = [NSURL URLWithString:[NSString stringWithUTF8String:"http://a.com/p"]];
+  if ([url query] != nil)
+    return -2;
+  url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:"/tmp/a"]];
+  if ([url query] != nil)
+    return -3;
+  return 0;
+}
+
+int test_NSString_compare_options() {
+  NSString *abc = [NSString stringWithUTF8String:"abc"];
+  NSString *ABC = [NSString stringWithUTF8String:"ABC"];
+  if ([abc compare:ABC options:0] != NSOrderedDescending)
+    return -1;
+  if ([abc compare:ABC options:NSCaseInsensitiveSearch] != NSOrderedSame)
+    return -2;
+  // Equal but not identical: ordered literally instead.
+  if ([abc compare:ABC
+           options:NSCaseInsensitiveSearch | NSForcedOrderingSearch] !=
+      NSOrderedDescending)
+    return -3;
+  if ([abc compare:abc options:NSForcedOrderingSearch] != NSOrderedSame)
+    return -4;
+
+  NSString *file10 = [NSString stringWithUTF8String:"File10"];
+  NSString *file9 = [NSString stringWithUTF8String:"file9"];
+  if ([file10 compare:file9
+              options:NSNumericSearch | NSCaseInsensitiveSearch] !=
+      NSOrderedDescending)
+    return -5;
+
+  NSString *a01 = [NSString stringWithUTF8String:"a01"];
+  NSString *a1 = [NSString stringWithUTF8String:"a1"];
+  if ([a01 compare:a1 options:NSNumericSearch] != NSOrderedSame)
+    return -6;
+  // The one with more digits is later, unlike a literal comparison.
+  if ([a01 compare:a1 options:NSNumericSearch | NSForcedOrderingSearch] !=
+      NSOrderedDescending)
+    return -7;
+  if ([a01 compare:a1 options:NSForcedOrderingSearch] != NSOrderedAscending)
+    return -8;
+  NSString *a01b = [NSString stringWithUTF8String:"a01b"];
+  NSString *a1B = [NSString stringWithUTF8String:"a1B"];
+  if ([a01b compare:a1B
+            options:NSNumericSearch | NSCaseInsensitiveSearch |
+                    NSForcedOrderingSearch] != NSOrderedDescending)
+    return -9;
+  if ([a01b compare:a1B
+            options:NSCaseInsensitiveSearch | NSForcedOrderingSearch] !=
+      NSOrderedAscending)
+    return -10;
   return 0;
 }
 
@@ -5979,11 +7509,21 @@ int test_wcsftime() {
   id receivedValue;
   const char *cstringValue;
   int intValue;
+  SEL selValue;
+  short shortValue;
+  char charValue;
+  long long longLongValue;
+  double doubleValue;
 }
 - (void)storeValue:(id)value;
 - (void)clearValue;
 - (void)storeCString:(const char *)str;
 - (void)storeIntPtr:(int *)ptr;
+- (void)storeSel:(SEL)sel
+           short:(short)h
+            char:(char)c
+        longLong:(long long)q
+          double:(double)d;
 @end
 
 @implementation InvocationTarget
@@ -5998,6 +7538,17 @@ int test_wcsftime() {
 }
 - (void)storeIntPtr:(int *)ptr {
   intValue = *ptr;
+}
+- (void)storeSel:(SEL)sel
+           short:(short)h
+            char:(char)c
+        longLong:(long long)q
+          double:(double)d {
+  selValue = sel;
+  shortValue = h;
+  charValue = c;
+  longLongValue = q;
+  doubleValue = d;
 }
 @end
 
@@ -6104,6 +7655,79 @@ int test_NSInvocation() {
 
   [pool drain];
   return 0;
+}
+
+int test_NSInvocation_scalarArguments() {
+  NSAutoreleasePool *pool = [NSAutoreleasePool new];
+
+  InvocationTarget *target = [InvocationTarget new];
+  SEL sel = NSSelectorFromString(
+      [NSString stringWithUTF8String:"storeSel:short:char:longLong:double:"]);
+  NSMethodSignature *sig = [target methodSignatureForSelector:sel];
+  NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+  [inv setTarget:target];
+  [inv setSelector:sel];
+
+  SEL selArg = NSSelectorFromString([NSString stringWithUTF8String:"self"]);
+  short h = -300;
+  char c = -5;
+  long long q = 0x123456789LL;
+  double d = 2.5;
+  [inv setArgument:&selArg atIndex:2];
+  [inv setArgument:&h atIndex:3];
+  [inv setArgument:&c atIndex:4];
+  [inv setArgument:&q atIndex:5];
+  [inv setArgument:&d atIndex:6];
+  [inv invoke];
+
+  int res = 0;
+  if (target->selValue != selArg)
+    res = -1;
+  else if (target->shortValue != -300 || target->charValue != -5)
+    res = -2;
+  else if (target->longLongValue != 0x123456789LL)
+    res = -3;
+  else if (target->doubleValue != 2.5)
+    res = -4;
+  [target release];
+  [pool drain];
+  return res;
+}
+
+int test_NSInvocationOperation_invocation() {
+  NSAutoreleasePool *pool = [NSAutoreleasePool new];
+
+  InvocationTarget *target = [InvocationTarget new];
+  SEL sel = NSSelectorFromString([NSString stringWithUTF8String:"storeValue:"]);
+  NSInvocation *inv = [NSInvocation
+      invocationWithMethodSignature:[target methodSignatureForSelector:sel]];
+  [inv setTarget:target];
+  [inv setSelector:sel];
+  NSObject *val = [NSObject new];
+  [inv setArgument:&val atIndex:2];
+  NSUInteger before = [val retainCount];
+
+  // The operation keeps the arguments alive until it runs.
+  NSInvocationOperation *op =
+      [[NSInvocationOperation alloc] initWithInvocation:inv];
+  NSUInteger retained = [val retainCount];
+  int res = 0;
+  if (retained <= before)
+    res = -3;
+  // Retaining them again does nothing.
+  [inv retainArguments];
+  if (res == 0 && [val retainCount] != retained)
+    res = -4;
+  [op start];
+  if (res == 0 && ![op isFinished])
+    res = -1;
+  else if (res == 0 && target->receivedValue != val)
+    res = -2;
+  [op release];
+  [val release];
+  [target release];
+  [pool drain];
+  return res;
 }
 
 int test_NSInvocation_invokeWithTarget() {
@@ -6306,6 +7930,9 @@ int test_NSInvocation_pointer() {
 }
 @end
 
+// Set if a keyed coder says it doesn't allow keyed coding.
+static int g_coder_not_keyed = 0;
+
 @interface IntCoderObject : NSObject {
 @public
   int value;
@@ -6320,11 +7947,15 @@ int test_NSInvocation_pointer() {
 }
 
 - (void)encodeWithCoder:(NSCoder *)coder {
+  if (![coder allowsKeyedCoding])
+    g_coder_not_keyed = 1;
   [coder encodeInt:value forKey:[NSString stringWithUTF8String:"value"]];
 }
 
 - (instancetype)initWithCoder:(NSCoder *)coder {
   self = [super init];
+  if (![coder allowsKeyedCoding])
+    g_coder_not_keyed = 1;
   value = [coder decodeIntForKey:[NSString stringWithUTF8String:"value"]];
   return self;
 }
@@ -6349,7 +7980,17 @@ int test_NSKeyedArchiver_encodeIntForKey() {
   }
 
   [pool drain];
-  return 0;
+  return g_coder_not_keyed ? -10 : 0;
+}
+
+int test_NSKeyedArchiver_NSDate() {
+  NSAutoreleasePool *pool = [NSAutoreleasePool new];
+  NSDate *date = [NSDate dateWithTimeIntervalSinceReferenceDate:123456.75];
+  NSData *data = [NSKeyedArchiver archivedDataWithRootObject:date];
+  NSDate *copy = [NSKeyedUnarchiver unarchiveObjectWithData:data];
+  int res = [copy timeIntervalSinceReferenceDate] == 123456.75 ? 0 : -1;
+  [pool drain];
+  return res;
 }
 
 int test_NSKeyedArchiver_NSKeyedUnarchiver() {
@@ -6872,6 +8513,291 @@ int test_NSNotificationCenter_addObserver_nilName_removeObserver() {
   return 0;
 }
 
+int test_NSMutableArray_removeObjectsInArray_otherArray() {
+  NSAutoreleasePool *pool = [NSAutoreleasePool new];
+
+  // Duplicate objects are removed as well.
+  NSMutableArray *array =
+      [[NSMutableArray alloc] initWithObjects:@1, @2, @3, @4, @5, @2, nil];
+  NSArray *otherArray = [[NSArray alloc] initWithObjects:@2, @4, @99, nil];
+  [array removeObjectsInArray:otherArray];
+  [otherArray release];
+
+  if ([array count] != 3) {
+    [array release];
+    [pool drain];
+    return -1;
+  }
+
+  // Expected: [1, 3, 5]
+  NSArray *expectedArray = [[NSArray alloc] initWithObjects:@1, @3, @5, nil];
+  if (![array isEqualToArray:expectedArray]) {
+    [expectedArray release];
+    [array release];
+    [pool drain];
+    return -2;
+  }
+
+  [expectedArray release];
+  [array release];
+  [pool drain];
+  return 0;
+}
+
+@interface KVOObserver : NSObject {
+@public
+  int count;
+  id lastNew;
+  id lastOld;
+  void *lastContext;
+}
+@end
+
+@implementation KVOObserver
+- (void)observeValueForKeyPath:(NSString *)keyPath
+                      ofObject:(id)object
+                        change:(NSDictionary *)change
+                       context:(void *)context {
+  count++;
+  lastNew = [change objectForKey:NSKeyValueChangeNewKey];
+  lastOld = [change objectForKey:NSKeyValueChangeOldKey];
+  lastContext = context;
+}
+@end
+
+// Changes its value the way NSUserDefaults does, with manual notifications.
+@interface KVOObserved : NSObject {
+  NSNumber *value;
+}
+@end
+
+@implementation KVOObserved
+// Otherwise real Foundation also notifies automatically from setValue:.
++ (BOOL)automaticallyNotifiesObserversForKey:(NSString *)key {
+  return NO;
+}
+- (id)valueForKey:(NSString *)key {
+  return value;
+}
+- (void)setValue:(NSNumber *)newValue {
+  NSString *key = [NSString stringWithUTF8String:"value"];
+  [self willChangeValueForKey:key];
+  [newValue retain];
+  [value release];
+  value = newValue;
+  [self didChangeValueForKey:key];
+}
+- (void)dealloc {
+  [value release];
+  [super dealloc];
+}
+@end
+
+int test_KVO_manual_notifications() {
+  NSAutoreleasePool *pool = [NSAutoreleasePool new];
+  KVOObserved *object = [KVOObserved new];
+  KVOObserver *observer = [KVOObserver new];
+  NSString *key = [NSString stringWithUTF8String:"value"];
+  static int context;
+  int res = 0;
+
+  [object
+      addObserver:observer
+       forKeyPath:key
+          options:NSKeyValueObservingOptionNew | NSKeyValueObservingOptionOld |
+                  NSKeyValueObservingOptionInitial
+          context:&context];
+  // Initial: the current value (none), and no old value.
+  if (observer->count != 1 || observer->lastNew != [NSNull null] ||
+      observer->lastOld != nil || observer->lastContext != &context) {
+    res = -1;
+  }
+
+  [object setValue:[NSNumber numberWithInt:5]];
+  if (!res && (observer->count != 2 || [observer->lastNew intValue] != 5 ||
+               observer->lastOld != [NSNull null])) {
+    res = -2;
+  }
+
+  [object setValue:[NSNumber numberWithInt:7]];
+  if (!res && (observer->count != 3 || [observer->lastNew intValue] != 7 ||
+               [observer->lastOld intValue] != 5)) {
+    res = -3;
+  }
+
+  [object removeObserver:observer forKeyPath:key];
+  [object setValue:[NSNumber numberWithInt:9]];
+  if (!res && observer->count != 3) {
+    res = -4;
+  }
+
+  [object release];
+  [observer release];
+  [pool drain];
+  return res;
+}
+
+int test_NSDirectoryEnumerator() {
+#ifdef DEFINE_ME_WHEN_BUILDING_ON_MACOS
+  // This checks the app's sandbox (the bundle in the home directory) and
+  // name-ordered entries, as on iPhone OS. macOS has neither.
+  return 0;
+#endif
+  NSAutoreleasePool *pool = [NSAutoreleasePool new];
+  NSFileManager *fm = [NSFileManager defaultManager];
+  NSString *bundle = [NSString stringWithUTF8String:path_test_app()];
+  NSString *testApp = [NSString stringWithUTF8String:"TestApp.app"];
+  int res = 0;
+
+  // The bundle's files, in name order, all at level 1.
+  NSDirectoryEnumerator *e = [fm enumeratorAtPath:bundle];
+  if ([[[e directoryAttributes] objectForKey:NSFileType]
+          isEqualToString:NSFileTypeDirectory] == NO) {
+    res = -1;
+    goto out;
+  }
+  char last[256] = "";
+  int count = 0;
+  BOOL foundPlist = NO;
+  for (NSString *name = [e nextObject]; name; name = [e nextObject]) {
+    const char *c_name = [name UTF8String];
+    if (strcmp(last, c_name) >= 0 || [e level] != 1) {
+      res = -2;
+      goto out;
+    }
+    strncpy(last, c_name, sizeof(last) - 1);
+    if (!strcmp(c_name, "Info.plist")) {
+      foundPlist = [[[e fileAttributes] objectForKey:NSFileType]
+          isEqualToString:NSFileTypeRegular];
+    }
+    count++;
+  }
+  if (!foundPlist || count < 2 ||
+      [[[fm enumeratorAtPath:bundle] allObjects] count] != count) {
+    res = -3;
+    goto out;
+  }
+
+  // Skipping the bundle when walking the app's home directory.
+  e = [fm enumeratorAtPath:NSHomeDirectory()];
+  BOOL foundBundle = NO;
+  for (NSString *name = [e nextObject]; name; name = [e nextObject]) {
+    if ([name isEqualToString:testApp]) {
+      foundBundle = YES;
+      if ([e level] != 1) {
+        res = -4;
+        goto out;
+      }
+      [e skipDescendents];
+    } else if (!strncmp([name UTF8String], "TestApp.app/", 12)) {
+      res = -5;
+      goto out;
+    }
+  }
+  if (!foundBundle) {
+    res = -6;
+    goto out;
+  }
+
+  // Without skipping, the bundle's files come next, at level 2.
+  e = [fm enumeratorAtPath:NSHomeDirectory()];
+  BOOL foundInBundle = NO;
+  for (NSString *name = [e nextObject]; name; name = [e nextObject]) {
+    if (!strcmp([name UTF8String], "TestApp.app/Info.plist")) {
+      foundInBundle = [e level] == 2;
+    }
+  }
+  if (!foundInBundle) {
+    res = -7;
+    goto out;
+  }
+
+  // URLs, only the top level.
+  e = [fm enumeratorAtURL:[NSURL fileURLWithPath:NSHomeDirectory()]
+      includingPropertiesForKeys:nil
+                         options:
+                             NSDirectoryEnumerationSkipsSubdirectoryDescendants
+                    errorHandler:nil];
+  foundBundle = NO;
+  for (NSURL *url = [e nextObject]; url; url = [e nextObject]) {
+    const char *path = [[url path] UTF8String];
+    const char *slash = strrchr(path, '/');
+    if (slash && !strcmp(slash, "/TestApp.app")) {
+      foundBundle = YES;
+    } else if (strstr(path, "/TestApp.app/")) {
+      res = -8;
+      goto out;
+    }
+  }
+  if (!foundBundle) {
+    res = -9;
+  }
+
+out:
+  [pool drain];
+  return res;
+}
+
+@interface IMPTarget : NSObject
+- (int)triple:(int)x;
+@end
+
+@implementation IMPTarget
+- (int)triple:(int)x {
+  return x * 3;
+}
+@end
+
+int test_methodForSelector() {
+  IMPTarget *target = [IMPTarget new];
+  int res = 0;
+
+  // A method of the app's own.
+  typedef int (*TripleIMP)(id, SEL, int);
+  SEL triple = @selector(triple:);
+  TripleIMP f = (TripleIMP)[IMPTarget instanceMethodForSelector:triple];
+  if (!f || f(target, triple, 5) != 15 ||
+      (TripleIMP)[target methodForSelector:triple] != f) {
+    res = -1;
+  }
+
+  // A method implemented by the emulator.
+  typedef NSUInteger (*RetainCountIMP)(id, SEL);
+  SEL retainCount = @selector(retainCount);
+  RetainCountIMP g =
+      (RetainCountIMP)[IMPTarget instanceMethodForSelector:retainCount];
+  if (!res && (!g || g(target, retainCount) != 1 ||
+               (RetainCountIMP)[target methodForSelector:retainCount] != g)) {
+    res = -2;
+  }
+
+  [target release];
+  return res;
+}
+
+int test_nil_path_or_key() {
+  if ([NSArray arrayWithContentsOfFile:nil] ||
+      [NSMutableArray arrayWithContentsOfFile:nil] ||
+      [NSDictionary dictionaryWithContentsOfFile:nil] ||
+      [NSMutableDictionary dictionaryWithContentsOfFile:nil])
+    return -1;
+  if ([NSArray arrayWithContentsOfURL:nil] ||
+      [NSMutableArray arrayWithContentsOfURL:nil] ||
+      [NSDictionary dictionaryWithContentsOfURL:nil] ||
+      [NSMutableDictionary dictionaryWithContentsOfURL:nil])
+    return -2;
+  NSDictionary *dict =
+      [NSDictionary dictionaryWithObjects:[NSArray arrayWithObjects:@1, nil]
+                                  forKeys:[NSArray arrayWithObjects:@2, nil]];
+  if ([dict valueForKey:nil])
+    return -3;
+  NSMutableArray *array = [NSMutableArray array];
+  [array removeLastObject];
+  if ([array count] != 0)
+    return -4;
+  return 0;
+}
+
 int test_malloc_zone_basic() {
   malloc_zone_t *zone = malloc_create_zone(0, 0);
   unsigned char *p = malloc_zone_malloc(zone, 128);
@@ -7090,6 +9016,70 @@ cleanup:
 }
 
 // clang-format off
+static void *pipe_writer(void *write_fd) {
+  usleep(10000);
+  write(*(int *)write_fd, "x", 1);
+  return NULL;
+}
+
+int test_pipe() {
+  int fds[2];
+  char buf[4];
+  fd_set set;
+  struct timeval timeout = {0, 1000};
+  pthread_t thread;
+  if (pipe(fds) != 0) {
+    return -1;
+  }
+  // Nothing to read yet.
+  FD_ZERO(&set);
+  FD_SET(fds[0], &set);
+  if (select(fds[0] + 1, &set, NULL, NULL, &timeout) != 0 ||
+      FD_ISSET(fds[0], &set)) {
+    return -2;
+  }
+  fcntl(fds[0], F_SETFL, O_NONBLOCK);
+  if (read(fds[0], buf, sizeof(buf)) != -1 || errno != EAGAIN) {
+    return -3;
+  }
+  fcntl(fds[0], F_SETFL, 0);
+  // select() with no timeout waits for another thread's write.
+  pthread_create(&thread, NULL, pipe_writer, &fds[1]);
+  FD_ZERO(&set);
+  FD_SET(fds[0], &set);
+  if (select(fds[0] + 1, &set, NULL, NULL, NULL) != 1 ||
+      !FD_ISSET(fds[0], &set)) {
+    return -4;
+  }
+  pthread_join(thread, NULL);
+  if (read(fds[0], buf, sizeof(buf)) != 1 || buf[0] != 'x') {
+    return -5;
+  }
+  // So does a blocking read.
+  pthread_create(&thread, NULL, pipe_writer, &fds[1]);
+  if (read(fds[0], buf, sizeof(buf)) != 1 || buf[0] != 'x') {
+    return -6;
+  }
+  pthread_join(thread, NULL);
+  // EOF once the write end is closed.
+  close(fds[1]);
+  if (read(fds[0], buf, sizeof(buf)) != 0) {
+    return -7;
+  }
+  close(fds[0]);
+  // Writing with the read end closed fails.
+  if (pipe(fds) != 0) {
+    return -8;
+  }
+  close(fds[0]);
+  signal(SIGPIPE, SIG_IGN);
+  if (write(fds[1], "x", 1) != -1 || errno != EPIPE) {
+    return -9;
+  }
+  close(fds[1]);
+  return 0;
+}
+
 #define FUNC_DEF(func)                                                         \
   { &func, #func }
 struct {
@@ -7107,7 +9097,22 @@ struct {
 #endif
     FUNC_DEF(test_qsort),
     FUNC_DEF(test_vsnprintf),
+    FUNC_DEF(test_NSObject_self),
+    FUNC_DEF(test_class_copyPropertyList),
+    FUNC_DEF(test_statfs),
+    FUNC_DEF(test_Foundation_small_gaps),
+    FUNC_DEF(test_Foundation_constants),
+    FUNC_DEF(test_CFArray_sort_and_copy),
+    FUNC_DEF(test_NSAssertionHandler),
+    FUNC_DEF(test_NSError),
+    FUNC_DEF(test_NSURLConnection_offline),
+    FUNC_DEF(test_NSNumber_objCType),
+    FUNC_DEF(test_valueForKey),
+    FUNC_DEF(test_NSString_ranges_and_encodings),
+    FUNC_DEF(test_NSData_description),
     FUNC_DEF(test_CC_SHA256),
+    FUNC_DEF(test_CCCrypt),
+    FUNC_DEF(test_CCHmac),
     FUNC_DEF(test_sscanf),
     FUNC_DEF(test_swscanf),
     FUNC_DEF(test_realloc),
@@ -7124,6 +9129,10 @@ struct {
     FUNC_DEF(test_setlocale),
     FUNC_DEF(test_strtoul),
     FUNC_DEF(test_strtol),
+    FUNC_DEF(test_strtoll),
+    FUNC_DEF(test_mktemp),
+    FUNC_DEF(test_basename),
+    FUNC_DEF(test_getpeername),
     FUNC_DEF(test_wcstol),
     FUNC_DEF(test_dirent),
     FUNC_DEF(test_scandir),
@@ -7169,6 +9178,15 @@ struct {
     FUNC_DEF(test_NSConditionLock_producer_consumer),
     FUNC_DEF(test_NSThread_isExecuting_isFinished),
     FUNC_DEF(test_NSThread_exit_pthread_exit),
+    FUNC_DEF(test_NSOperationQueue),
+    FUNC_DEF(test_NSPort),
+    FUNC_DEF(test_NSRunLoop_runMode),
+    FUNC_DEF(test_NSCalendar),
+    FUNC_DEF(test_NSDictionary_subclass),
+    FUNC_DEF(test_NSSortDescriptor_selector),
+    FUNC_DEF(test_NSMutableSet_addObjectsFromArray),
+    FUNC_DEF(test_class_cluster_subclasses),
+    FUNC_DEF(test_NSDictionary_values),
     FUNC_DEF(test_CFMutableDictionary_NullCallbacks),
     FUNC_DEF(test_CFMutableDictionary_CustomCallbacks_PrimitiveTypes),
     FUNC_DEF(test_CFMutableDictionary_CustomCallbacks_CFTypes),
@@ -7189,9 +9207,15 @@ struct {
     FUNC_DEF(test_CGGeometry),
     FUNC_DEF(test_CFURLHasDirectoryPath),
     FUNC_DEF(test_CGImage_JPEG),
+    FUNC_DEF(test_CGContext_paths),
+    FUNC_DEF(test_CGContext_clip),
+    FUNC_DEF(test_CGLayer),
     FUNC_DEF(test_NSMutableString_deleteCharactersInRange),
+    FUNC_DEF(test_NSMutableString_insertString_atIndex),
     FUNC_DEF(test_NSString_stringByReplacingOccurrencesOfString),
     FUNC_DEF(test_NSString_stringByReplacingOccurrencesOfString_options_range),
+    FUNC_DEF(test_NSString_compare_options),
+    FUNC_DEF(test_NSURL_query),
     FUNC_DEF(test_NSString_pathWithComponents),
     FUNC_DEF(test_strptime),
     FUNC_DEF(test_uname),
@@ -7203,12 +9227,15 @@ struct {
     FUNC_DEF(test_RespondsToSelector),
     FUNC_DEF(test_class_getInstanceMethod),
     FUNC_DEF(test_NSKeyedArchiver_encodeIntForKey),
+    FUNC_DEF(test_NSKeyedArchiver_NSDate),
     FUNC_DEF(test_NSKeyedArchiver_NSKeyedUnarchiver),
     FUNC_DEF(test_NSKeyedArchiver_NSDictionary_of_NSArray_of_NSStrings),
     FUNC_DEF(test_AutoreleasePool),
     FUNC_DEF(test_NSNumber_stringValue),
     FUNC_DEF(test_NSMethodSignature),
     FUNC_DEF(test_NSInvocation),
+    FUNC_DEF(test_NSInvocation_scalarArguments),
+    FUNC_DEF(test_NSInvocationOperation_invocation),
     FUNC_DEF(test_NSInvocation_invokeWithTarget),
     FUNC_DEF(test_NSInvocation_retainArguments),
     FUNC_DEF(test_NSInvocation_pointer),
@@ -7216,10 +9243,16 @@ struct {
     FUNC_DEF(test_NSNotificationCenter_addObserver_nilName),
     FUNC_DEF(test_NSNotificationCenter_addObserver_nilName_withObject),
     FUNC_DEF(test_NSNotificationCenter_addObserver_nilName_removeObserver),
+    FUNC_DEF(test_NSMutableArray_removeObjectsInArray_otherArray),
+    FUNC_DEF(test_KVO_manual_notifications),
+    FUNC_DEF(test_NSDirectoryEnumerator),
+    FUNC_DEF(test_methodForSelector),
+    FUNC_DEF(test_nil_path_or_key),
     FUNC_DEF(test_malloc_zone_basic),
     FUNC_DEF(test_malloc_zone_struct_dispatch),
     FUNC_DEF(test_fcvt),
     FUNC_DEF(test_tempfile),
+    FUNC_DEF(test_pipe),
 };
 // clang-format on
 

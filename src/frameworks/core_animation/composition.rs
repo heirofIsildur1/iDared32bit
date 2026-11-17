@@ -11,10 +11,10 @@
 #![allow(clippy::zero_ptr)] // alas, as you know, opengl
 
 use super::ca_eagl_layer::find_fullscreen_eagl_layer;
-use super::ca_layer::CALayerHostObject;
+use super::ca_layer::{CALayerHostObject, ContentsGravity};
 use crate::frameworks::core_animation::animation;
 use crate::frameworks::core_graphics::cg_color::CGColorHostObject;
-use crate::frameworks::core_graphics::{cg_bitmap_context, cg_image, CGFloat, CGRect};
+use crate::frameworks::core_graphics::{cg_bitmap_context, cg_image, CGFloat, CGRect, CGSize};
 use crate::gles::gles11_raw as gles11; // constants only
 use crate::gles::gles11_raw::types::*;
 use crate::gles::present::{present_frame, FpsCounter, TextureCoordinates};
@@ -23,7 +23,7 @@ use crate::gles::GLES; // constants only
 use crate::image::Image;
 use crate::matrix::Matrix;
 use crate::mem::SafeWrite;
-use crate::objc::{id, msg, msg_class, nil, ObjC};
+use crate::objc::{id, msg, msg_class, nil, release, retain, ObjC};
 use crate::Environment;
 use std::time::{Duration, Instant};
 
@@ -34,6 +34,85 @@ pub(super) struct State {
     recomposite_next: Option<Instant>,
     fps_counter: Option<FpsCounter>,
     misc_gl_objects: Option<MiscGlObjects>,
+    /// Fade transitions that have been added to layers.
+    transitions: Vec<Transition>,
+    /// Screen width and height, and the part of the framebuffer texture it
+    /// covers, for drawing transition snapshots.
+    snapshot_uv: (f32, f32, f32, f32),
+    /// Framebuffer pixels per point, across and down, and the framebuffer's
+    /// height, for clipping.
+    clip_scale: (f32, f32, f32),
+}
+
+/// A clip rectangle in framebuffer pixels: x, y (from the bottom), width and
+/// height, as for `glScissor`.
+type Clip = [i32; 4];
+
+/// Clips drawing to `clip`, or not at all.
+unsafe fn set_clip(gles: &mut dyn GLES, clip: Option<Clip>) {
+    if let Some([x, y, w, h]) = clip {
+        gles.Enable(gles11::SCISSOR_TEST);
+        gles.Scissor(x, y, w, h);
+    } else {
+        gles.Disable(gles11::SCISSOR_TEST);
+    }
+}
+
+/// The clip for a layer that masks to its bounds: its bounds on screen (as a
+/// rectangle around them, if it's rotated), within the clip it's drawn in.
+fn bounds_clip(
+    (sx, sy, fb_height): (f32, f32, f32),
+    bounds: CGRect,
+    cumulative_transform: &Matrix<4>,
+    clip: Option<Clip>,
+) -> Clip {
+    let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for (u, v) in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)] {
+        let x = bounds.origin.x + u * bounds.size.width;
+        let y = bounds.origin.y + v * bounds.size.height;
+        let [px, py, _, _] = cumulative_transform.transform([x, y, 0.0, 1.0]);
+        (x0, y0, x1, y1) = (x0.min(px), y0.min(py), x1.max(px), y1.max(py));
+    }
+    // OpenGL counts rows from the bottom.
+    let (left, right) = ((x0 * sx).round() as i32, (x1 * sx).round() as i32);
+    let (bottom, top) = (
+        (fb_height - y1 * sy).round() as i32,
+        (fb_height - y0 * sy).round() as i32,
+    );
+    let (mut left, mut bottom, mut right, mut top) = (left, bottom, right, top);
+    if let Some([cx, cy, cw, ch]) = clip {
+        left = left.max(cx);
+        bottom = bottom.max(cy);
+        right = right.min(cx + cw);
+        top = top.min(cy + ch);
+    }
+    [left, bottom, (right - left).max(0), (top - bottom).max(0)]
+}
+
+struct Transition {
+    layer: id,
+    animation: id,
+    /// What was on screen just before the transition began, the size of
+    /// the framebuffer texture.
+    snapshot: Option<GLuint>,
+    snapshot_taken: bool,
+}
+
+/// For `addAnimation:forKey:`: the next frame starts by keeping a picture of
+/// the screen, which the transition fades out.
+pub(super) fn add_transition(env: &mut Environment, layer: id, animation: id) {
+    retain(env, layer);
+    retain(env, animation);
+    env.framework_state
+        .core_animation
+        .composition
+        .transitions
+        .push(Transition {
+            layer,
+            animation,
+            snapshot: None,
+            snapshot_taken: false,
+        });
 }
 
 struct MiscGlObjects {
@@ -176,6 +255,8 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
         .core_animation
         .composition
         .texture_framebuffer;
+    // The framebuffer still holds the last frame, unless it's new.
+    let have_last_frame = cached.is_some_and(|(_, _, size)| size == (pot_width, pot_height));
     let texture = if let Some((texture, framebuffer, _)) =
         cached.filter(|&(_, _, size)| size == (pot_width, pot_height))
     {
@@ -254,6 +335,72 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
             .texture_framebuffer = Some((texture, framebuffer, (pot_width, pot_height)));
         texture
     };
+
+    // Forget transitions that are over, and keep a picture of the last frame
+    // for new ones: that's what they fade from.
+    let transitions =
+        std::mem::take(&mut env.framework_state.core_animation.composition.transitions);
+    let mut transitions_over = Vec::new();
+    for mut transition in transitions {
+        let layer = env.objc.borrow::<CALayerHostObject>(transition.layer);
+        let attached = layer
+            .animations
+            .values()
+            .any(|&a| a == transition.animation)
+            || layer.anonymous_animations.contains(&transition.animation);
+        if !attached {
+            if let Some(snapshot) = transition.snapshot {
+                unsafe { gles.DeleteTextures(1, &snapshot) };
+            }
+            transitions_over.push(transition);
+            continue;
+        }
+        if !transition.snapshot_taken {
+            transition.snapshot_taken = true;
+            if have_last_frame {
+                let mut snapshot = 0;
+                unsafe {
+                    gles.GenTextures(1, &mut snapshot);
+                    gles.BindTexture(gles11::TEXTURE_2D, snapshot);
+                    gles.CopyTexImage2D(
+                        gles11::TEXTURE_2D,
+                        0,
+                        gles11::RGBA,
+                        0,
+                        0,
+                        pot_width as _,
+                        pot_height as _,
+                        0,
+                    );
+                    for (pname, param) in [
+                        (gles11::TEXTURE_MIN_FILTER, gles11::LINEAR),
+                        (gles11::TEXTURE_MAG_FILTER, gles11::LINEAR),
+                        (gles11::TEXTURE_WRAP_S, gles11::CLAMP_TO_EDGE),
+                        (gles11::TEXTURE_WRAP_T, gles11::CLAMP_TO_EDGE),
+                    ] {
+                        gles.TexParameteri(gles11::TEXTURE_2D, pname, param as _);
+                    }
+                }
+                transition.snapshot = Some(snapshot);
+            }
+        }
+        env.framework_state
+            .core_animation
+            .composition
+            .transitions
+            .push(transition);
+    }
+    env.framework_state.core_animation.composition.clip_scale = (
+        fb_width as f32 / screen_bounds.size.width,
+        fb_height as f32 / screen_bounds.size.height,
+        fb_height as f32,
+    );
+    env.framework_state.core_animation.composition.snapshot_uv = (
+        screen_bounds.size.width,
+        screen_bounds.size.height,
+        fb_width as f32 / pot_width as f32,
+        fb_height as f32 / pot_height as f32,
+    );
 
     // Set up various other GL objects that will be reused on every frame.
     let misc_gl_objects = env
@@ -364,6 +511,11 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
     }
     std::mem::drop(gles);
 
+    for transition in transitions_over {
+        release(env, transition.animation);
+        release(env, transition.layer);
+    }
+
     // Assumes the windows in the list are ordered back-to-front.
     // TODO: this may not be correct once we support windowLevel.
     for root_layer in window_layers {
@@ -375,6 +527,7 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
                 root_layer,
                 cumulative_transform,
                 opacity,
+                None,
             );
         }
     }
@@ -388,6 +541,7 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
         gles.Viewport(0, 0, fb_width as _, fb_height as _);
         gles.Color4f(1.0, 1.0, 1.0, 1.0);
         gles.Disable(gles11::BLEND);
+        gles.Disable(gles11::SCISSOR_TEST);
         gles.MatrixMode(gles11::PROJECTION);
         gles.LoadIdentity();
         gles.MatrixMode(gles11::MODELVIEW);
@@ -458,16 +612,16 @@ unsafe fn composite_layer_recursive(
     layer: id,
     cumulative_transform: Matrix<4>,
     opacity: CGFloat,
+    clip: Option<Clip>,
 ) {
-    // TODO: this can't handle zPosition among other things, but it is not
-    //       supported yet :)
     // TODO: back-to-front drawing is not efficient, could we use front-to-back?
 
     // This is both acting as the presentationLayer and the private render layer
     // It might need to be reworked in the future into a guest presentationLayer
     let host_obj = animation_state.create_presentation_layer(env, layer);
 
-    if host_obj.hidden {
+    // A layer being hidden by a fade transition still shows the old picture.
+    if host_obj.hidden && host_obj.fade_transition.is_none() {
         return;
     }
 
@@ -495,6 +649,36 @@ unsafe fn composite_layer_recursive(
 
         cumulative_transform
     };
+
+    // A layer that masks to its bounds clips itself and its sublayers.
+    let clip = if host_obj.masks_to_bounds {
+        let clip_scale = env.framework_state.core_animation.composition.clip_scale;
+        Some(bounds_clip(
+            clip_scale,
+            host_obj.bounds,
+            &cumulative_transform,
+            clip,
+        ))
+    } else {
+        clip
+    };
+    if clip.is_some_and(|[_, _, w, h]| w == 0 || h == 0) {
+        return;
+    }
+    set_clip(gles.as_mut(), clip);
+
+    if host_obj.hidden {
+        std::mem::drop(gles);
+        let (animation, progress) = host_obj.fade_transition.unwrap();
+        draw_transition_snapshot(
+            env,
+            animation,
+            progress,
+            host_obj.bounds,
+            cumulative_transform,
+        );
+        return;
+    }
 
     // Draw background color, if any
     let have_background = if let Some(background_color) = host_obj.background_color {
@@ -577,7 +761,9 @@ unsafe fn composite_layer_recursive(
     let need_texture = host_obj.presented_pixels.is_some()
         || host_obj.contents != nil
         || host_obj.cg_context.is_some();
-    let need_update = need_texture && !host_obj.gles_texture_is_up_to_date;
+    let need_update = need_texture
+        && (!host_obj.gles_texture_is_up_to_date
+            || host_obj.contents != host_obj.gles_texture_contents);
 
     if need_texture {
         if let Some(texture) = host_obj.gles_texture {
@@ -630,10 +816,10 @@ unsafe fn composite_layer_recursive(
     }
 
     if need_update {
-        // Update original layer field
-        env.objc
-            .borrow_mut::<CALayerHostObject>(layer)
-            .gles_texture_is_up_to_date = true;
+        // Update original layer fields
+        let original_host_obj = env.objc.borrow_mut::<CALayerHostObject>(layer);
+        original_host_obj.gles_texture_is_up_to_date = true;
+        original_host_obj.gles_texture_contents = host_obj.contents;
     }
 
     // Draw texture, if any
@@ -663,7 +849,10 @@ unsafe fn composite_layer_recursive(
         };
 
         gles.Color4f(opacity, opacity, opacity, opacity);
-        if opacity == 1.0 && host_obj.opaque && !have_background {
+        // `opaque` doesn't affect images set as contents: their alpha
+        // channel is kept.
+        let opaque = host_obj.opaque && host_obj.contents == nil;
+        if opacity == 1.0 && opaque && !have_background {
             gles.Disable(gles11::BLEND);
         } else {
             gles.Enable(gles11::BLEND);
@@ -694,6 +883,26 @@ unsafe fn composite_layer_recursive(
 
         gles.TexCoordPointer(2, gles11::FLOAT, 0, tex_coords.as_ptr() as *const GLvoid);
         gles.Enable(gles11::TEXTURE_2D);
+
+        // An image only fills the bounds if its gravity says so.
+        let gravity = host_obj.contents_gravity;
+        if host_obj.contents != nil && gravity != ContentsGravity::Resize {
+            let image = cg_image::borrow_image(&env.objc, host_obj.contents);
+            let (w, h) = image.dimensions();
+            let size = CGSize {
+                width: w as CGFloat,
+                height: h as CGFloat,
+            };
+            let rect = gravity.rect(host_obj.bounds, size);
+            gles.MatrixMode(gles11::MODELVIEW);
+            load_matrix(
+                gles.as_mut(),
+                Matrix::<4>::from(&Matrix::scale_2d(rect.size.width, rect.size.height))
+                    .multiply(&Matrix::translate_3d(rect.origin.x, rect.origin.y, 0.0))
+                    .multiply(&cumulative_transform),
+            );
+        }
+
         gles.DrawElements(
             gles11::TRIANGLES,
             SQUARE_INDICES.len() as _,
@@ -704,17 +913,109 @@ unsafe fn composite_layer_recursive(
     std::mem::drop(gles);
 
     // avoid holding mutable borrow while recursing
-    let original_host_obj = env.objc.borrow_mut::<CALayerHostObject>(layer);
-    for &child_layer in &original_host_obj.sublayers.clone() {
-        // TODO: clipping/masksToBounds support
+    let mut sublayers = env
+        .objc
+        .borrow::<CALayerHostObject>(layer)
+        .sublayers
+        .clone();
+    // Higher zPosition is drawn on top. The sort is stable, so layers with
+    // the same zPosition keep their order.
+    sublayers.sort_by(|&a, &b| {
+        let a = env.objc.borrow::<CALayerHostObject>(a).z_position;
+        let b = env.objc.borrow::<CALayerHostObject>(b).z_position;
+        a.total_cmp(&b)
+    });
+    for &child_layer in &sublayers {
         composite_layer_recursive(
             env,
             animation_state,
             child_layer,
             cumulative_transform,
             opacity,
+            clip,
         )
     }
+
+    // The transition covers the sublayers too.
+    if let Some((animation, progress)) = host_obj.fade_transition {
+        let window = env.window.as_mut().unwrap();
+        set_clip(window.make_internal_gl_ctx_current().as_mut(), clip);
+        draw_transition_snapshot(
+            env,
+            animation,
+            progress,
+            host_obj.bounds,
+            cumulative_transform,
+        );
+    }
+}
+
+/// Fades out the picture from before a transition over the layer: drawing it
+/// at `1 - progress` over the new picture crossfades between them.
+unsafe fn draw_transition_snapshot(
+    env: &mut Environment,
+    animation: id,
+    progress: f32,
+    bounds: CGRect,
+    cumulative_transform: Matrix<4>,
+) {
+    let state = &env.framework_state.core_animation.composition;
+    // There's none if the transition began on the first frame.
+    let Some(snapshot) = state
+        .transitions
+        .iter()
+        .find(|transition| transition.animation == animation)
+        .and_then(|transition| transition.snapshot)
+    else {
+        return;
+    };
+    let (screen_width, screen_height, u_max, v_max) = state.snapshot_uv;
+    let square_buffer = state.misc_gl_objects.as_ref().unwrap().basic_square_buffer;
+
+    // Where each corner of the layer was on screen, in the snapshot. Its rows
+    // are bottom-to-top.
+    let mut tex_coords = [0f32; 8];
+    let corners = BASIC_SQUARE_POINTS.as_chunks::<2>().0;
+    for (&[u, v], coords) in corners.iter().zip(tex_coords.as_chunks_mut::<2>().0) {
+        let x = bounds.origin.x + u * bounds.size.width;
+        let y = bounds.origin.y + v * bounds.size.height;
+        let [screen_x, screen_y, _, _] = cumulative_transform.transform([x, y, 0.0, 1.0]);
+        *coords = [
+            screen_x / screen_width * u_max,
+            (1.0 - screen_y / screen_height) * v_max,
+        ];
+    }
+
+    let window = env.window.as_mut().unwrap();
+    let mut gles = window.make_internal_gl_ctx_current();
+    gles.MatrixMode(gles11::MODELVIEW);
+    load_matrix(
+        gles.as_mut(),
+        Matrix::<4>::from(&Matrix::scale_2d(bounds.size.width, bounds.size.height))
+            .multiply(&Matrix::translate_3d(bounds.origin.x, bounds.origin.y, 0.0))
+            .multiply(&cumulative_transform),
+    );
+
+    let alpha = 1.0 - progress;
+    gles.Color4f(alpha, alpha, alpha, alpha);
+    gles.Enable(gles11::BLEND);
+    gles.BlendFunc(gles11::ONE, gles11::ONE_MINUS_SRC_ALPHA);
+
+    gles.EnableClientState(gles11::VERTEX_ARRAY);
+    gles.BindBuffer(gles11::ARRAY_BUFFER, square_buffer);
+    gles.VertexPointer(2, gles11::FLOAT, 0, 0 as *const GLvoid);
+    gles.EnableClientState(gles11::TEXTURE_COORD_ARRAY);
+    gles.BindBuffer(gles11::ARRAY_BUFFER, 0);
+    gles.TexCoordPointer(2, gles11::FLOAT, 0, tex_coords.as_ptr() as *const GLvoid);
+
+    gles.Enable(gles11::TEXTURE_2D);
+    gles.BindTexture(gles11::TEXTURE_2D, snapshot);
+    gles.DrawElements(
+        gles11::TRIANGLES,
+        SQUARE_INDICES.len() as _,
+        gles11::UNSIGNED_BYTE,
+        0 as *const GLvoid,
+    );
 }
 
 const FLOATS_PER_POINT: usize = 2;

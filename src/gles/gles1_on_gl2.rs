@@ -28,7 +28,7 @@ use super::util::{
 };
 use super::GLESContext;
 use crate::window::{GLContext, GLVersion, Window};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::ffi::CStr;
 
 /// List of capabilities shared by OpenGL ES 1.1 and OpenGL 2.1.
@@ -102,9 +102,15 @@ struct ArrayStateBackup {
     buffer_binding: GLuint,
 }
 
+/// GL_OES_point_size_array has no OpenGL 2.1 equivalent, so this layer
+/// keeps the array's state itself.
+const POINT_SIZE_ARRAY_OES: GLenum = 0x8B9C;
+const POINT_SIZE_ARRAY_TYPE_OES: GLenum = 0x898A;
+const POINT_SIZE_ARRAY_STRIDE_OES: GLenum = 0x898B;
+const POINT_SIZE_ARRAY_POINTER_OES: GLenum = 0x898C;
+const POINT_SIZE_ARRAY_BUFFER_BINDING_OES: GLenum = 0x8B9F;
+
 /// List of arrays shared by OpenGL ES 1.1 and OpenGL 2.1.
-///
-/// TODO: GL_POINT_SIZE_ARRAY_OES?
 pub const ARRAYS: &[ArrayInfo] = &[
     ArrayInfo {
         name: gl21::COLOR_ARRAY,
@@ -408,9 +414,13 @@ pub struct GLES1OnGL2State {
     /// An error this layer raised itself, which glGetError() returns before
     /// any from the underlying OpenGL.
     pending_error: Option<GLenum>,
-    pointer_is_fixed_point: [bool; ARRAYS.len()],
-    fixed_point_texture_units: HashSet<GLenum>,
+    /// For arrays OpenGL 2.1 can't take as they are (GL_FIXED, or GL_BYTE
+    /// co-ordinates), the type to translate to floats from at draw time.
+    pointer_translated_from: [Option<GLenum>; ARRAYS.len()],
+    /// The same for each texture unit, which has its own co-ordinates.
+    translated_texture_units: HashMap<GLenum, GLenum>,
     fixed_point_translation_buffers: [Vec<GLfloat>; ARRAYS.len()],
+    point_size_array_enabled: bool,
 }
 
 pub struct GLES1OnGL2Context {
@@ -428,9 +438,10 @@ impl GLESContext for GLES1OnGL2Context {
             gl_ctx: window.create_gl_context(GLVersion::GL21Compat)?,
             state: GLES1OnGL2State {
                 pending_error: None,
-                pointer_is_fixed_point: [false; ARRAYS.len()],
-                fixed_point_texture_units: HashSet::new(),
+                pointer_translated_from: [None; ARRAYS.len()],
+                translated_texture_units: HashMap::new(),
                 fixed_point_translation_buffers: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
+                point_size_array_enabled: false,
             },
             is_loaded: false,
         })
@@ -498,8 +509,26 @@ impl GLES1OnGL2<'_> {
         true
     }
 
-    /// If any arrays with fixed-point data are in use at the time of a draw
-    /// call, this function will convert the data to floating-point and
+    /// The point size array's parameters. glPointSizePointerOES isn't
+    /// implemented, so all but whether it's enabled are the defaults.
+    fn point_size_array_param(&self, pname: GLenum) -> Option<GLint> {
+        match pname {
+            POINT_SIZE_ARRAY_OES => Some(self.state.point_size_array_enabled.into()),
+            POINT_SIZE_ARRAY_TYPE_OES => Some(gl21::FLOAT as GLint),
+            POINT_SIZE_ARRAY_STRIDE_OES | POINT_SIZE_ARRAY_BUFFER_BINDING_OES => Some(0),
+            _ => None,
+        }
+    }
+
+    /// Per-point sizes can't be drawn with OpenGL 2.1's fixed function.
+    fn check_point_size_array(&self, mode: GLenum) {
+        if mode == gl21::POINTS && self.state.point_size_array_enabled {
+            unimplemented!("Drawing points with GL_POINT_SIZE_ARRAY_OES");
+        }
+    }
+
+    /// If any arrays with fixed-point (or byte) data are in use at the time of
+    /// a draw call, this function will convert the data to floating-point and
     /// replace the pointers. [Self::restore_fixed_point_arrays] can be called
     /// after to restore the original state.
     unsafe fn translate_fixed_point_arrays(
@@ -511,9 +540,9 @@ impl GLES1OnGL2<'_> {
         for (i, array_info) in ARRAYS.iter().enumerate() {
             // Decide whether we need to do anything for this array
 
-            if !self.state.pointer_is_fixed_point[i] {
+            let Some(mut from_type) = self.state.pointer_translated_from[i] else {
                 continue;
-            }
+            };
 
             // There is one texture co-ordinates pointer per texture unit.
             let old_client_active_texture = if array_info.name == gl21::TEXTURE_COORD_ARRAY {
@@ -524,13 +553,11 @@ impl GLES1OnGL2<'_> {
                     gl21::ACTIVE_TEXTURE,
                     &mut active_texture as *mut _ as *mut _,
                 );
-                if !self
-                    .state
-                    .fixed_point_texture_units
-                    .contains(&active_texture)
-                {
+                let Some(&unit_type) = self.state.translated_texture_units.get(&active_texture)
+                else {
                     continue;
-                }
+                };
+                from_type = unit_type;
 
                 // Make sure our glTexCoordPointer call will affect that unit.
                 let mut old_client_active_texture: GLenum = 0;
@@ -596,7 +623,11 @@ impl GLES1OnGL2<'_> {
             });
             let stride = if stride == 0 {
                 // tightly packed mode
-                size * 4 // sizeof(gl::FLOAT)
+                if from_type == gl21::BYTE {
+                    size
+                } else {
+                    size * 4 // sizeof(GLfixed)
+                }
             } else {
                 stride
             };
@@ -613,9 +644,15 @@ impl GLES1OnGL2<'_> {
                 let stride = stride as usize;
                 for j in first..(first + count) {
                     let vector_ptr: *const GLvoid = pointer.add(j * stride);
-                    let vector_ptr: *const GLfixed = vector_ptr.cast();
                     for k in 0..size {
-                        buffer[j * size + k] = fixed_to_float(vector_ptr.add(k).read_unaligned());
+                        // As in OpenGL ES, bytes aren't normalized.
+                        buffer[j * size + k] = if from_type == gl21::BYTE {
+                            let vector_ptr: *const i8 = vector_ptr.cast();
+                            vector_ptr.add(k).read().into()
+                        } else {
+                            let vector_ptr: *const GLfixed = vector_ptr.cast();
+                            fixed_to_float(vector_ptr.add(k).read_unaligned())
+                        };
                     }
                 }
             }
@@ -682,8 +719,8 @@ impl GLES1OnGL2<'_> {
                     );
                     assert!(self
                         .state
-                        .fixed_point_texture_units
-                        .contains(&active_texture));
+                        .translated_texture_units
+                        .contains_key(&active_texture));
                     let mut old_client_active_texture: GLenum = 0;
                     gl21::GetIntegerv(
                         gl21::CLIENT_ACTIVE_TEXTURE,
@@ -740,6 +777,9 @@ impl GLES for GLES1OnGL2<'_> {
         gl21::Enable(cap);
     }
     unsafe fn IsEnabled(&mut self, cap: GLenum) -> GLboolean {
+        if cap == POINT_SIZE_ARRAY_OES {
+            return self.state.point_size_array_enabled.into();
+        }
         assert!(
             CAPABILITIES.contains(&cap) || ARRAYS.iter().any(|&ArrayInfo { name, .. }| name == cap)
         );
@@ -763,6 +803,10 @@ impl GLES for GLES1OnGL2<'_> {
         gl21::ClientActiveTexture(texture);
     }
     unsafe fn EnableClientState(&mut self, array: GLenum) {
+        if array == POINT_SIZE_ARRAY_OES {
+            self.state.point_size_array_enabled = true;
+            return;
+        }
         if CAPABILITIES.contains(&array) {
             log_dbg!(
                 "Tolerating glEnableClientState({:#x}) of a capability",
@@ -774,6 +818,10 @@ impl GLES for GLES1OnGL2<'_> {
         gl21::EnableClientState(array);
     }
     unsafe fn DisableClientState(&mut self, array: GLenum) {
+        if array == POINT_SIZE_ARRAY_OES {
+            self.state.point_size_array_enabled = false;
+            return;
+        }
         if CAPABILITIES.contains(&array) {
             log_dbg!(
                 "Tolerating glDisableClientState({:#x}) of a capability",
@@ -786,6 +834,10 @@ impl GLES for GLES1OnGL2<'_> {
     }
     unsafe fn GetBooleanv(&mut self, pname: GLenum, params: *mut GLboolean) {
         if self.reject_es2_only_get_param("glGetBooleanv", pname) {
+            return;
+        }
+        if let Some(value) = self.point_size_array_param(pname) {
+            *params = (value != 0).into();
             return;
         }
         let (type_, count) = GET_PARAMS.get_type_info(pname);
@@ -813,6 +865,10 @@ impl GLES for GLES1OnGL2<'_> {
         if self.reject_es2_only_get_param("glGetFloatv", pname) {
             return;
         }
+        if let Some(value) = self.point_size_array_param(pname) {
+            *params = value as GLfloat;
+            return;
+        }
         let (type_, _count) = GET_PARAMS.get_type_info(pname);
         match type_ {
             ParamType::Float | ParamType::FloatSpecial => {
@@ -825,10 +881,21 @@ impl GLES for GLES1OnGL2<'_> {
         if self.reject_es2_only_get_param("glGetIntegerv", pname) {
             return;
         }
+        if let Some(value) = self.point_size_array_param(pname) {
+            *params = value;
+            return;
+        }
+
         let (type_, _count) = GET_PARAMS.get_type_info(pname);
-        // TODO: type conversion
-        let allowed_float = type_ == ParamType::Float && pname == gl21::POINT_SIZE_MAX;
+
+        // Float parameters that can be queried as integers.
+        let allowed_float = type_ == ParamType::Float
+            && (pname == gl21::POINT_SIZE_MAX
+                || pname == gl21::MAX_TEXTURE_MAX_ANISOTROPY_EXT
+                || pname == gl21::MAX_TEXTURE_LOD_BIAS_EXT);
+
         assert!(type_ == ParamType::Int || allowed_float);
+
         gl21::GetIntegerv(pname, params);
     }
     unsafe fn GetTexEnviv(&mut self, target: GLenum, pname: GLenum, params: *mut GLint) {
@@ -844,6 +911,10 @@ impl GLES for GLES1OnGL2<'_> {
         gl21::GetTexEnvfv(target, pname, params);
     }
     unsafe fn GetPointerv(&mut self, pname: GLenum, params: *mut *const GLvoid) {
+        if pname == POINT_SIZE_ARRAY_POINTER_OES {
+            *params = std::ptr::null();
+            return;
+        }
         assert!(ARRAYS
             .iter()
             .any(|&ArrayInfo { pointer, .. }| pname == pointer));
@@ -1304,22 +1375,22 @@ impl GLES for GLES1OnGL2<'_> {
         assert!(size == 4);
         if type_ == gles11::FIXED {
             // Translation deferred until draw call
-            self.state.pointer_is_fixed_point[0] = true;
+            self.state.pointer_translated_from[0] = Some(gles11::FIXED);
             gl21::ColorPointer(size, gl21::FLOAT, stride, pointer)
         } else {
             assert!(type_ == gl21::UNSIGNED_BYTE || type_ == gl21::FLOAT);
-            self.state.pointer_is_fixed_point[0] = false;
+            self.state.pointer_translated_from[0] = None;
             gl21::ColorPointer(size, type_, stride, pointer)
         }
     }
     unsafe fn NormalPointer(&mut self, type_: GLenum, stride: GLsizei, pointer: *const GLvoid) {
         if type_ == gles11::FIXED {
             // Translation deferred until draw call
-            self.state.pointer_is_fixed_point[1] = true;
+            self.state.pointer_translated_from[1] = Some(gles11::FIXED);
             gl21::NormalPointer(gl21::FLOAT, stride, pointer)
         } else {
             assert!(type_ == gl21::BYTE || type_ == gl21::SHORT || type_ == gl21::FLOAT);
-            self.state.pointer_is_fixed_point[1] = false;
+            self.state.pointer_translated_from[1] = None;
             gl21::NormalPointer(type_, stride, pointer)
         }
     }
@@ -1336,18 +1407,19 @@ impl GLES for GLES1OnGL2<'_> {
             gl21::CLIENT_ACTIVE_TEXTURE,
             &mut active_texture as *mut _ as *mut _,
         );
-        if type_ == gles11::FIXED {
-            // Translation deferred until draw call.
-            // There is one texture co-ordinates pointer per texture unit.
-            self.state.fixed_point_texture_units.insert(active_texture);
-            self.state.pointer_is_fixed_point[2] = true;
+        if type_ == gles11::FIXED || type_ == gl21::BYTE {
+            // OpenGL 2.1 has neither, so translation is deferred until draw
+            // call. There is one texture co-ordinates pointer per texture unit.
+            self.state
+                .translated_texture_units
+                .insert(active_texture, type_);
+            self.state.pointer_translated_from[2] = Some(type_);
             gl21::TexCoordPointer(size, gl21::FLOAT, stride, pointer)
         } else {
-            // TODO: byte
             assert!(type_ == gl21::SHORT || type_ == gl21::FLOAT);
-            self.state.fixed_point_texture_units.remove(&active_texture);
-            if self.state.fixed_point_texture_units.is_empty() {
-                self.state.pointer_is_fixed_point[2] = false;
+            self.state.translated_texture_units.remove(&active_texture);
+            if self.state.translated_texture_units.is_empty() {
+                self.state.pointer_translated_from[2] = None;
             }
             gl21::TexCoordPointer(size, type_, stride, pointer)
         }
@@ -1360,14 +1432,14 @@ impl GLES for GLES1OnGL2<'_> {
         pointer: *const GLvoid,
     ) {
         assert!(size == 2 || size == 3 || size == 4);
-        if type_ == gles11::FIXED {
-            // Translation deferred until draw call
-            self.state.pointer_is_fixed_point[3] = true;
+        if type_ == gles11::FIXED || type_ == gl21::BYTE {
+            // OpenGL 2.1 has neither, so translation is deferred until draw
+            // call.
+            self.state.pointer_translated_from[3] = Some(type_);
             gl21::VertexPointer(size, gl21::FLOAT, stride, pointer)
         } else {
-            // TODO: byte
             assert!(type_ == gl21::SHORT || type_ == gl21::FLOAT);
-            self.state.pointer_is_fixed_point[3] = false;
+            self.state.pointer_translated_from[3] = None;
             gl21::VertexPointer(size, type_, stride, pointer)
         }
     }
@@ -1384,6 +1456,7 @@ impl GLES for GLES1OnGL2<'_> {
             gl21::TRIANGLES
         ]
         .contains(&mode));
+        self.check_point_size_array(mode);
 
         let fixed_point_arrays_state_backup = self.translate_fixed_point_arrays(first, count);
 
@@ -1409,12 +1482,13 @@ impl GLES for GLES1OnGL2<'_> {
         ]
         .contains(&mode));
         assert!(type_ == gl21::UNSIGNED_BYTE || type_ == gl21::UNSIGNED_SHORT);
+        self.check_point_size_array(mode);
 
         let fixed_point_arrays_state_backup = if self
             .state
-            .pointer_is_fixed_point
+            .pointer_translated_from
             .iter()
-            .any(|&is_fixed| is_fixed)
+            .any(|from_type| from_type.is_some())
         {
             // Scan the index buffer to find the range of data that may need
             // fixed-point translation.

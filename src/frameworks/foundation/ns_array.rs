@@ -22,7 +22,7 @@ use crate::libc::stdlib::qsort::qsort_generic;
 use crate::mem::{ConstPtr, MutPtr, MutVoidPtr, Ptr};
 use crate::objc::{
     autorelease, id, msg, msg_class, msg_send, nil, objc_classes, release, retain, Class,
-    ClassExports, HostObject, NSZonePtr, SEL,
+    ClassExports, HostObject, NSZonePtr, TrivialHostObject, SEL,
 };
 use crate::Environment;
 
@@ -53,9 +53,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 @implementation NSArray: NSObject
 
 + (id)allocWithZone:(NSZonePtr)zone {
-    // NSArray might be subclassed by something which needs allocWithZone:
-    // to have the normal behaviour. Unimplemented: call superclass alloc then.
-    assert!(this == env.objc.get_known_class("NSArray", &mut env.mem));
+    // A subclass from the game stores its own contents, so it gets the
+    // normal behaviour, like NSObject's.
+    if this != env.objc.get_known_class("NSArray", &mut env.mem) {
+        return env.objc.alloc_object(this, Box::new(TrivialHostObject), &mut env.mem);
+    }
     msg_class![env; _touchHLE_NSArray allocWithZone:zone]
 }
 
@@ -117,6 +119,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 // These probably comes from some category related to plists.
 - (id)initWithContentsOfFile:(id)path { // NSString*
     release(env, this);
+    if path == nil {
+        return nil;
+    }
     let path = ns_string::to_rust_string(env, path);
     deserialize_plist_from_file(
         env,
@@ -126,6 +131,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 - (id)initWithContentsOfURL:(id)url { // NSURL*
     release(env, this);
+    if url == nil {
+        return nil;
+    }
     let path = ns_url::to_rust_path(env, url);
     deserialize_plist_from_file(env, &path, /* array_expected: */ true)
 }
@@ -164,6 +172,32 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
     NSNotFound as NSUInteger
 }
+// These work through count and objectAtIndex:, for subclasses from the game.
+// Our private subclasses have faster versions.
+- (id)objectEnumerator { // NSEnumerator*
+    let objects = objects_via_primitives(env, this);
+    object_enumerator_inner_helper(env, this, objects)
+}
+- (id)reverseObjectEnumerator { // NSEnumerator*
+    let mut objects = objects_via_primitives(env, this);
+    objects.reverse();
+    object_enumerator_inner_helper(env, this, objects)
+}
+
+// NSFastEnumeration implementation
+- (NSUInteger)countByEnumeratingWithState:(MutPtr<NSFastEnumerationState>)state
+                                  objects:(MutPtr<id>)stackbuf
+                                    count:(NSUInteger)len {
+    let count: NSUInteger = msg![env; this count];
+    fast_enumeration_helper(env, this, |env, idx| {
+        if idx < count {
+            msg![env; this objectAtIndex:idx]
+        } else {
+            nil
+        }
+    }, state, stackbuf, len)
+}
+
 - (bool)containsObject:(id)object {
     let idx: NSUInteger = msg![env; this indexOfObject:object];
     idx != NSNotFound as NSUInteger
@@ -262,9 +296,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 @implementation NSMutableArray: NSArray
 
 + (id)allocWithZone:(NSZonePtr)zone {
-    // NSArray might be subclassed by something which needs allocWithZone:
-    // to have the normal behaviour. Unimplemented: call superclass alloc then.
-    assert!(this == env.objc.get_known_class("NSMutableArray", &mut env.mem));
+    // A subclass from the game stores its own contents, so it gets the
+    // normal behaviour, like NSObject's.
+    if this != env.objc.get_known_class("NSMutableArray", &mut env.mem) {
+        return env.objc.alloc_object(this, Box::new(TrivialHostObject), &mut env.mem);
+    }
     msg_class![env; _touchHLE_NSMutableArray allocWithZone:zone]
 }
 
@@ -299,6 +335,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 // These probably comes from some category related to plists.
 - (id)initWithContentsOfFile:(id)path { // NSString*
     release(env, this);
+    if path == nil {
+        return nil;
+    }
     let path = ns_string::to_rust_string(env, path);
     let tmp = deserialize_plist_from_file(
         env,
@@ -316,6 +355,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 - (id)initWithContentsOfURL:(id)url { // NSURL*
     release(env, this);
+    if url == nil {
+        return nil;
+    }
     let path = ns_url::to_rust_path(env, url);
     let tmp = deserialize_plist_from_file(env, &path, /* array_expected: */ true);
     if tmp == nil {
@@ -419,20 +461,6 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 - (id)reverseObjectEnumerator { // NSEnumerator*
     reverse_object_enumerator_inner(env, this)
-}
-
-// NSFastEnumeration implementation
-- (NSUInteger)countByEnumeratingWithState:(MutPtr<NSFastEnumerationState>)state
-                                  objects:(MutPtr<id>)stackbuf
-                                    count:(NSUInteger)len {
-    let count: NSUInteger = msg![env; this count];
-    fast_enumeration_helper(env, this, |env, idx| {
-        if idx < count {
-            msg![env; this objectAtIndex:idx]
-        } else {
-            nil
-        }
-    }, state, stackbuf, len)
 }
 
 // TODO: more init methods, etc
@@ -729,8 +757,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())removeLastObject {
-    let object = env.objc.borrow_mut::<ArrayHostObject>(this).array.pop().unwrap();
-    release(env, object)
+    // Apple's docs say this raises on an empty array, but it does nothing.
+    if let Some(object) = env.objc.borrow_mut::<ArrayHostObject>(this).array.pop() {
+        release(env, object)
+    }
 }
 
 - (())removeAllObjects {
@@ -741,6 +771,34 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
 
     env.objc.borrow_mut::<ArrayHostObject>(this).array = Vec::new()
+}
+
+- (())removeObjectsInArray:(id)other { // NSArray*
+    let other_count: NSUInteger = msg![env; other count];
+    if other_count == 0 {
+        return;
+    }
+
+    let host_object: &mut ArrayHostObject = env.objc.borrow_mut(this);
+    let array = std::mem::take(&mut host_object.array);
+
+    // Since removing objects individually has to iterate the whole array
+    // for each object (with [array removeObject:obj]), so this just saves some
+    // runtime costs.
+    let other_array_set: id = msg_class![env; NSSet alloc];
+    let other_array_set: id = msg![env; other_array_set initWithArray:other];
+    let mut new_array = Vec::with_capacity(array.len());
+    for object in array {
+        let contains: bool = msg![env; other_array_set containsObject:object];
+        if contains {
+            release(env, object);
+        } else {
+            new_array.push(object);
+        }
+    }
+
+    env.objc.borrow_mut::<ArrayHostObject>(this).array = new_array;
+    release(env, other_array_set);
 }
 
 @end
@@ -763,6 +821,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())removeLastObject {
     env.objc.borrow_mut::<ArrayHostObject>(this).array.pop().unwrap();
+}
+
+- (())replaceObjectAtIndex:(NSUInteger)index withObject:(id)obj {
+    env.objc.borrow_mut::<ArrayHostObject>(this).array[index as usize] = obj;
 }
 
 @end
@@ -831,6 +893,12 @@ fn reverse_object_enumerator_inner(env: &mut Environment, arr: id) -> id {
         .cloned()
         .collect::<Vec<_>>();
     object_enumerator_inner_helper(env, arr, vec)
+}
+
+/// The objects of any array, through `count` and `objectAtIndex:`.
+fn objects_via_primitives(env: &mut Environment, arr: id) -> Vec<id> {
+    let count: NSUInteger = msg![env; arr count];
+    (0..count).map(|i| msg![env; arr objectAtIndex:i]).collect()
 }
 
 fn object_enumerator_inner_helper(env: &mut Environment, arr: id, vec: Vec<id>) -> id {

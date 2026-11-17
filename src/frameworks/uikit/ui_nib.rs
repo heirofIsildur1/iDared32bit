@@ -276,6 +276,13 @@ pub const CLASSES: ClassExports = objc_classes! {
     let selector = to_rust_string(env, label);
     let action = env.objc.lookup_selector(&selector).unwrap();
 
+    // Bar button items aren't controls: they have one target and action.
+    let bar_button_item = env.objc.get_known_class("UIBarButtonItem", &mut env.mem);
+    if msg![env; source isKindOfClass:bar_button_item] {
+        () = msg![env; source setTarget:destination];
+        () = msg![env; source setAction:action];
+        return;
+    }
     () = msg![env; source addTarget:destination action:action forControlEvents:event_mask];
 }
 
@@ -290,10 +297,6 @@ pub const CLASSES: ClassExports = objc_classes! {
     host_obj.event_mask = event_mask as UIControlEvents;
 
     this
-}
-
-- (())dealloc {
-    env.objc.dealloc_object(this, &mut env.mem)
 }
 
 @end
@@ -390,13 +393,14 @@ fn load_nib_file(env: &mut Environment, ui_nib: id, path: GuestPathBuf) -> Resul
         () = msg![env; next awakeFromNib];
     }
 
-    // Make visible windows visible
+    // "Visible at Launch" windows are also made key, so games that never
+    // call makeKeyAndVisible still have a keyWindow.
     let visibles_key = get_static_str(env, "UINibVisibleWindowsKey");
     let visibles: id = msg![env; unarchiver decodeObjectForKey:visibles_key];
     let visibles_count: NSUInteger = msg![env; visibles count];
     for i in 0..visibles_count {
         let visible: id = msg![env; visibles objectAtIndex:i];
-        () = msg![env; visible setHidden:false];
+        () = msg![env; visible makeKeyAndVisible];
     }
 
     Ok(unarchiver)

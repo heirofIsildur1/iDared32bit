@@ -16,8 +16,9 @@ pub type NSErrorDomain = id;
 pub const NSCocoaErrorDomain: &str = "NSCocoaErrorDomain";
 pub const NSOSStatusErrorDomain: &str = "NSOSStatusErrorDomain";
 
-const NSLocalizedDescriptionKey: &str = "NSLocalizedDescriptionKey";
+pub(super) const NSLocalizedDescriptionKey: &str = "NSLocalizedDescriptionKey";
 const NSLocalizedFailureReasonErrorKey: &str = "NSLocalizedFailureReasonErrorKey";
+const NSUnderlyingErrorKey: &str = "NSUnderlyingError";
 
 pub const NSFileReadNoSuchFileError: NSInteger = 260;
 
@@ -93,8 +94,16 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.dealloc_object(this, &mut env.mem);
 }
 
+- (id)domain { // NSErrorDomain
+    env.objc.borrow::<ErrorHostObject>(this).domain
+}
+
 - (NSInteger)code {
     env.objc.borrow::<ErrorHostObject>(this).code
+}
+
+- (id)userInfo { // NSDictionary*
+    env.objc.borrow::<ErrorHostObject>(this).user_info
 }
 
 @end
@@ -109,6 +118,10 @@ pub const CONSTANTS: ConstantExports = &[
     (
         "_NSLocalizedFailureReasonErrorKey",
         HostConstant::NSString(NSLocalizedFailureReasonErrorKey),
+    ),
+    (
+        "_NSUnderlyingErrorKey",
+        HostConstant::NSString(NSUnderlyingErrorKey),
     ),
     (
         "_NSCocoaErrorDomain",

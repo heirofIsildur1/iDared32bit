@@ -30,10 +30,10 @@
 use crate::dyld::{export_c_func, FunctionExports};
 use crate::libc::errno::{
     set_errno, EAGAIN, EBADF, ECONNREFUSED, ECONNRESET, EHOSTUNREACH, EINVAL, ENETUNREACH,
-    ETIMEDOUT,
+    ENOTCONN, ETIMEDOUT,
 };
 use crate::libc::posix_io::{
-    close, find_or_create_socket, is_nonblocking, is_socket, FileDescriptor,
+    close, find_or_create_socket, is_nonblocking, is_socket, pipe_is_ready, FileDescriptor,
 };
 use crate::libc::time::timeval;
 use crate::mem::{
@@ -47,7 +47,7 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub const AF_INET: i32 = 2;
 pub const SOCK_STREAM: i32 = 1;
@@ -405,6 +405,45 @@ fn getsockname(
     0 // Success
 }
 
+fn getpeername(
+    env: &mut Environment,
+    socket: i32,
+    address: MutPtr<sockaddr>,
+    address_len: MutPtr<socklen_t>,
+) -> i32 {
+    set_errno(env, 0);
+
+    let Some(socket_host_object) = State::get(env).sockets.get(&socket) else {
+        set_errno(env, EBADF);
+        return -1;
+    };
+    // Only a connected socket has a peer: not a listener, and not a UDP
+    // socket that connect() wasn't called for.
+    let peer_addr = if let Some(tcp_stream) = &socket_host_object.tcp_stream {
+        Some(tcp_stream.peer_addr())
+    } else {
+        socket_host_object
+            .udp_socket
+            .as_ref()
+            .map(|udp_socket| udp_socket.peer_addr())
+    };
+    let peer_addr = match peer_addr {
+        Some(Ok(peer_addr @ SocketAddr::V4(_))) => peer_addr,
+        Some(Ok(SocketAddr::V6(_))) => unreachable!(), // Only IPv4 is supported.
+        Some(Err(error)) if error.kind() != io::ErrorKind::NotConnected => {
+            panic!("getpeername: socket {socket} encountered IO error: {error}")
+        }
+        None | Some(Err(_)) => {
+            set_errno(env, ENOTCONN);
+            return -1;
+        }
+    };
+    let peer_guest_addr = sockaddr::from_sockaddr_v4(&peer_addr);
+    write_sockaddr(env, address, address_len, peer_guest_addr);
+
+    0 // Success
+}
+
 fn bind(
     env: &mut Environment,
     socket: i32,
@@ -613,21 +652,39 @@ fn select(
         return 0;
     }
 
-    let should_block = if !timeout.is_null() {
+    // Checks every millisecond, letting other threads run, until something
+    // is ready or the timeout (if any) is over.
+    let deadline = (!timeout.is_null()).then(|| {
         let timeval = env.mem.read(timeout);
-        let tv_sec = timeval.tv_sec;
-        let tv_usec = timeval.tv_usec;
-        if tv_sec == 0 && tv_usec == 0 {
-            // Happy path, just polling once
-            false
-        } else {
-            log_dbg!("TODO: Ignore non-zero timeout {:?} in select()", timeval);
-            true
+        let duration = Duration::from_secs(timeval.tv_sec.try_into().unwrap())
+            + Duration::from_micros(timeval.tv_usec.try_into().unwrap());
+        Instant::now() + duration
+    });
+    let set_ptrs = [read_fds, write_fds, error_fds];
+    let sets = set_ptrs.map(|set| (!set.is_null()).then(|| env.mem.read(set)));
+    loop {
+        for (ptr, set) in set_ptrs.into_iter().zip(sets) {
+            if let Some(set) = set {
+                env.mem.write(ptr, set);
+            }
         }
-    } else {
-        true
-    };
+        let count = check_fds(env, n_fds, read_fds, write_fds, error_fds);
+        if count > 0 || deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return count;
+        }
+        env.sleep(Duration::from_millis(1));
+    }
+}
 
+/// Helper for [select]: checks each file descriptor once, leaving only the
+/// ready ones in the sets.
+fn check_fds(
+    env: &mut Environment,
+    n_fds: i32,
+    read_fds: MutPtr<fd_set>,
+    write_fds: MutPtr<fd_set>,
+    error_fds: MutPtr<fd_set>,
+) -> i32 {
     let mut count = 0;
 
     if !read_fds.is_null() {
@@ -635,7 +692,12 @@ fn select(
         log_dbg!("select: read_set before {:?}", read_set);
         count += process_set(env, &mut read_set, n_fds, |env, fd, bits, bit_index| {
             log_dbg!("select: bit set in read_set at fd: {}", fd);
-            // Only sockets for now
+            if let Some(ready) = pipe_is_ready(env, fd) {
+                if !ready {
+                    *bits &= !(1 << bit_index);
+                }
+                return ready;
+            }
             assert!(is_socket(env, fd));
             // Clean bit in the set for the current socket
             *bits &= !(1 << bit_index);
@@ -669,7 +731,6 @@ fn select(
                         }
                         Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                             log_dbg!("select: Socket {} would block on peeking, continue.", fd);
-                            assert!(!should_block); // TODO
                             false
                         }
                         Err(e) => {
@@ -708,7 +769,6 @@ fn select(
                             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                                 // No incoming connection is ready
                                 log_dbg!("select: TCP listener for socket {} would block on accepting, continue.", fd);
-                                assert!(!should_block); // TODO
                                 return false;
                             }
                             Err(e) => {
@@ -752,7 +812,6 @@ fn select(
                                 "select: TCP stream for socket {} would block on peeking, continue.",
                                 fd
                             );
-                            assert!(!should_block); // TODO
                             false
                         }
                         Err(e) => {
@@ -772,7 +831,12 @@ fn select(
         log_dbg!("select: write_set before {:?}", write_set);
         count += process_set(env, &mut write_set, n_fds, |env, fd, bits, bit_index| {
             log_dbg!("select: bit set in write_set at fd: {}", fd);
-            // Only sockets for now
+            if let Some(ready) = pipe_is_ready(env, fd) {
+                if !ready {
+                    *bits &= !(1 << bit_index);
+                }
+                return ready;
+            }
             assert!(is_socket(env, fd));
             // Clean bit in the set for the current socket
             *bits &= !(1 << bit_index);
@@ -789,7 +853,6 @@ fn select(
                         *bits |= 1 << bit_index;
                         true
                     } else {
-                        assert!(!should_block); // TODO
                         false
                     }
                 }
@@ -802,7 +865,6 @@ fn select(
                         *bits |= 1 << bit_index;
                         true
                     } else {
-                        assert!(!should_block); // TODO
                         false
                     }
                 }
@@ -818,7 +880,11 @@ fn select(
         log_dbg!("select: error_set before {:?}", error_set);
         count += process_set(env, &mut error_set, n_fds, |env, fd, bits, bit_index| {
             log_dbg!("select: bit set in error_set at fd: {}", fd);
-            // Only sockets for now
+            // Pipes have no exceptional conditions.
+            if pipe_is_ready(env, fd).is_some() {
+                *bits &= !(1 << bit_index);
+                return false;
+            }
             assert!(is_socket(env, fd));
             // Clean bit in the set for the current socket
             *bits &= !(1 << bit_index);
@@ -1264,6 +1330,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(getsockopt(_, _, _, _, _)),
     export_c_func!(setsockopt(_, _, _, _, _)),
     export_c_func!(getsockname(_, _, _)),
+    export_c_func!(getpeername(_, _, _)),
     export_c_func!(bind(_, _, _)),
     export_c_func!(listen(_, _)),
     export_c_func!(connect(_, _, _)),

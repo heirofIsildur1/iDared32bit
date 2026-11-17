@@ -32,6 +32,23 @@ unsigned char *CC_SHA256(const void *, CC_LONG, unsigned char *);
 int CC_SHA256_Init(CC_SHA256_CTX *);
 int CC_SHA256_Update(CC_SHA256_CTX *, const void *, CC_LONG);
 int CC_SHA256_Final(unsigned char *, CC_SHA256_CTX *);
+typedef int32_t CCCryptorStatus;
+typedef uint32_t CCOperation, CCAlgorithm, CCOptions, CCHmacAlgorithm;
+enum { kCCEncrypt = 0, kCCDecrypt };
+enum { kCCAlgorithmAES128 = 0 };
+enum { kCCOptionPKCS7Padding = 1, kCCOptionECBMode = 2 };
+enum {
+  kCCSuccess = 0,
+  kCCBufferTooSmall = -4301,
+  kCCAlignmentError = -4303,
+};
+enum { kCCHmacAlgSHA1, kCCHmacAlgMD5, kCCHmacAlgSHA256, kCCHmacAlgSHA384 };
+enum { kCCHmacAlgSHA512 = 4, kCCHmacAlgSHA224 };
+CCCryptorStatus CCCrypt(CCOperation, CCAlgorithm, CCOptions, const void *,
+                        size_t, const void *, const void *, size_t, void *,
+                        size_t, size_t *);
+void CCHmac(CCHmacAlgorithm, const void *, size_t, const void *, size_t,
+            void *);
 
 // Objective-C runtime
 
@@ -41,6 +58,7 @@ typedef signed char BOOL;
 
 typedef unsigned long NSUInteger;
 typedef signed long NSInteger;
+#define NSNotFound ((NSInteger)(~0UL >> 1))
 
 typedef struct _NSRange {
   NSUInteger location;
@@ -58,8 +76,13 @@ static inline NSRange NSMakeRange(NSUInteger loc, NSUInteger len) {
 
 // id objc_msgSend(id, SEL, ...);
 
+const char *sel_getName(SEL sel);
 typedef struct objc_method *Method;
 Method class_getInstanceMethod(Class cls, SEL name);
+typedef struct objc_property *objc_property_t;
+objc_property_t *class_copyPropertyList(Class cls, unsigned int *outCount);
+const char *property_getName(objc_property_t property);
+const char *property_getAttributes(objc_property_t property);
 #ifdef DEFINE_ME_WHEN_BUILDING_ON_MACOS
 SEL method_getName(Method m);
 // Returns IMP, which isn't declared here.
@@ -68,21 +91,55 @@ void (*method_getImplementation(Method m))(void);
 
 // Foundation
 
+@class NSMethodSignature;
+@class NSError;
+@class NSString;
+@class NSThread;
+
+typedef struct {
+  unsigned long state;
+  id *itemsPtr;
+  unsigned long *mutationsPtr;
+  unsigned long extra[5];
+} NSFastEnumerationState;
+
 @interface NSObject {
   Class isa;
 }
 + (Class)class;
++ (instancetype)self;
++ (Class)superclass;
++ (BOOL)isSubclassOfClass:(Class)aClass;
 + (instancetype)alloc;
 + (instancetype)new;
 + (BOOL)respondsToSelector:(SEL)selector;
 - (instancetype)init;
+- (instancetype)self;
+- (Class)class;
+- (BOOL)isEqual:(id)object;
+- (NSString *)description;
+- (Class)superclass;
 - (instancetype)retain;
 - (void)release;
 - (instancetype)autorelease;
 - (void)dealloc;
 - (NSUInteger)retainCount;
 - (id)performSelector:(SEL)selector;
+- (void)performSelector:(SEL)selector
+             withObject:(id)arg
+             afterDelay:(double)delay;
++ (void)cancelPreviousPerformRequestsWithTarget:(id)target;
+- (void)performSelector:(SEL)selector
+               onThread:(NSThread *)thread
+             withObject:(id)arg
+          waitUntilDone:(BOOL)wait;
 - (BOOL)respondsToSelector:(SEL)selector;
+- (NSMethodSignature *)methodSignatureForSelector:(SEL)selector;
+- (NSUInteger)countByEnumeratingWithState:(NSFastEnumerationState *)state
+                                  objects:(id *)buffer
+                                    count:(NSUInteger)len;
++ (void (*)(void))instanceMethodForSelector:(SEL)selector;
+- (void (*)(void))methodForSelector:(SEL)selector;
 @end
 
 @interface NSAutoreleasePool : NSObject
@@ -94,9 +151,26 @@ void (*method_getImplementation(Method m))(void);
 @interface NSArray<ObjectType> : NSObject
 + (instancetype)array;
 + (instancetype)arrayWithObjects:(ObjectType)firstObj, ...;
+- (instancetype)initWithObjects:(ObjectType)firstObj, ...;
 - (NSUInteger)count;
 - (ObjectType)objectAtIndex:(NSUInteger)index;
+- (BOOL)containsObject:(ObjectType)anObject;
 - (BOOL)isEqualToArray:(NSArray *)otherArray;
+- (id)objectEnumerator;
+- (NSArray *)sortedArrayUsingDescriptors:(NSArray *)descriptors;
+@end
+
+@interface NSMutableArray<ObjectType> : NSArray
+- (void)addObject:(id)object;
+- (void)removeObject:(id)object;
+- (void)removeObjectsInArray:(NSArray *)otherArray;
+- (void)removeLastObject;
+@end
+
+@class NSURL;
+@interface NSArray (NSArrayCreation)
++ (id)arrayWithContentsOfFile:(id)path;
++ (id)arrayWithContentsOfURL:(NSURL *)url;
 @end
 
 @interface NSDictionary<KeyType, ObjectType> : NSObject
@@ -105,15 +179,47 @@ void (*method_getImplementation(Method m))(void);
 - (NSUInteger)count;
 - (ObjectType)objectForKey:(KeyType)aKey;
 - (BOOL)isEqualToDictionary:(NSDictionary *)otherDictionary;
++ (id)dictionaryWithContentsOfFile:(id)path;
++ (id)dictionaryWithContentsOfURL:(NSURL *)url;
+- (id)valueForKey:(id)key;
+- (NSArray<KeyType> *)allKeys;
+- (NSArray<ObjectType> *)allValues;
+- (NSArray<KeyType> *)allKeysForObject:(ObjectType)anObject;
+- (id)objectEnumerator;
+- (id)keyEnumerator;
+@end
+
+@interface NSMutableDictionary<KeyType, ObjectType> : NSDictionary
+- (void)setObject:(ObjectType)anObject forKey:(KeyType)aKey;
+- (void)removeObjectsForKeys:(NSArray<KeyType> *)keys;
 @end
 
 @interface NSSet<ObjectType> : NSObject
 - (ObjectType)anyObject;
+- (NSArray<ObjectType> *)allObjects;
+- (NSUInteger)count;
+- (BOOL)containsObject:(ObjectType)anObject;
+@end
+
+@interface NSMutableSet<ObjectType> : NSSet
++ (instancetype)setWithCapacity:(NSUInteger)capacity;
+- (void)addObjectsFromArray:(NSArray<ObjectType> *)array;
 @end
 
 typedef enum {
   NSCaseInsensitiveSearch = 1,
+  NSLiteralSearch = 2,
+  NSBackwardsSearch = 4,
+  NSAnchoredSearch = 8,
+  NSNumericSearch = 64,
+  NSForcedOrderingSearch = 512,
 } NSStringCompareOptions;
+
+typedef enum {
+  NSOrderedAscending = -1,
+  NSOrderedSame,
+  NSOrderedDescending,
+} NSComparisonResult;
 
 @interface NSString : NSObject
 + (instancetype)stringWithFormat:(NSString *)format, ...;
@@ -127,17 +233,91 @@ typedef enum {
                                                (NSStringCompareOptions)options
                                              range:(NSRange)range;
 - (BOOL)isEqualToString:(NSString *)other;
+- (NSComparisonResult)compare:(NSString *)other
+                      options:(NSStringCompareOptions)mask;
+- (const char *)UTF8String;
+- (NSUInteger)length;
+- (unsigned short)characterAtIndex:(NSUInteger)index;
+- (NSArray *)componentsSeparatedByString:(NSString *)separator;
+- (NSRange)rangeOfString:(NSString *)string
+                 options:(NSStringCompareOptions)mask
+                   range:(NSRange)range;
+- (BOOL)canBeConvertedToEncoding:(NSUInteger)encoding;
+- (BOOL)getBytes:(void *)buffer
+         maxLength:(NSUInteger)maxLength
+        usedLength:(NSUInteger *)usedLength
+          encoding:(NSUInteger)encoding
+           options:(NSUInteger)options
+             range:(NSRange)range
+    remainingRange:(NSRange *)leftover;
+@end
+
+@interface NSSortDescriptor : NSObject
++ (instancetype)sortDescriptorWithKey:(NSString *)key
+                            ascending:(BOOL)ascending
+                             selector:(SEL)selector;
+- (instancetype)initWithKey:(NSString *)key
+                  ascending:(BOOL)ascending
+                   selector:(SEL)selector;
+- (SEL)selector;
 @end
 @interface NSMutableString : NSString
++ (instancetype)stringWithCapacity:(NSUInteger)capacity;
+- (void)appendString:(NSString *)string;
 - (void)deleteCharactersInRange:(NSRange)range;
+- (void)insertString:(NSString *)string atIndex:(NSUInteger)index;
+- (void)replaceCharactersInRange:(NSRange)range withString:(NSString *)string;
 @end
 
 @interface NSValue : NSObject
 @end
 
 @interface NSNumber : NSValue
++ (NSNumber *)numberWithInt:(int)value;
 + (NSNumber *)numberWithFloat:(float)value;
 + (NSNumber *)numberWithBool:(bool)value;
++ (NSNumber *)numberWithDouble:(double)value;
++ (NSNumber *)numberWithLongLong:(long long)value;
++ (NSNumber *)numberWithShort:(short)value;
++ (NSNumber *)numberWithUnsignedInt:(unsigned int)value;
+- (const char *)objCType;
+- (int)intValue;
+- (unsigned long long)unsignedLongLongValue;
+- (float)floatValue;
+- (BOOL)boolValue;
+@end
+
+@interface NSNull : NSObject
++ (NSNull *)null;
+@end
+
+@interface NSAssertionHandler : NSObject
++ (NSAssertionHandler *)currentHandler;
+@end
+
+@interface NSObject (NSKeyValueCoding)
+- (id)valueForKey:(id)key;
+- (NSDictionary *)dictionaryWithValuesForKeys:(NSArray *)keys;
+@end
+
+typedef enum {
+  NSKeyValueObservingOptionNew = 1,
+  NSKeyValueObservingOptionOld = 2,
+  NSKeyValueObservingOptionInitial = 4,
+  NSKeyValueObservingOptionPrior = 8,
+} NSKeyValueObservingOptions;
+extern NSString *const NSKeyValueChangeKindKey;
+extern NSString *const NSKeyValueChangeNewKey;
+extern NSString *const NSKeyValueChangeOldKey;
+
+@interface NSObject (NSKeyValueObserving)
+- (void)addObserver:(NSObject *)observer
+         forKeyPath:(NSString *)keyPath
+            options:(NSKeyValueObservingOptions)options
+            context:(void *)context;
+- (void)removeObserver:(NSObject *)observer forKeyPath:(NSString *)keyPath;
+- (void)willChangeValueForKey:(NSString *)key;
+- (void)didChangeValueForKey:(NSString *)key;
 @end
 
 NSString *NSStringFromClass(Class);
@@ -164,13 +344,84 @@ typedef double NSTimeInterval;
 @end
 
 @interface NSURL : NSObject
++ (NSURL *)fileURLWithPath:(NSString *)path;
++ (NSURL *)URLWithString:(NSString *)string;
+- (NSString *)query;
+- (NSString *)path;
+@end
+
+@interface NSURLRequest : NSObject
++ (instancetype)requestWithURL:(NSURL *)url;
+- (NSURL *)URL;
+- (id)mutableCopy;
+@end
+
+@interface NSMutableURLRequest : NSURLRequest
+@end
+
+@interface NSError : NSObject
++ (instancetype)errorWithDomain:(NSString *)domain
+                           code:(NSInteger)code
+                       userInfo:(NSDictionary *)userInfo;
+- (NSString *)domain;
+- (NSInteger)code;
+- (NSDictionary *)userInfo;
+@end
+
+@interface NSURLConnection : NSObject
+- (instancetype)initWithRequest:(NSURLRequest *)request delegate:(id)delegate;
+- (void)cancel;
+@end
+
+NSString *NSHomeDirectory(void);
+extern NSString *const NSFileType;
+extern NSString *const NSFileSystemSize;
+extern NSString *const NSFileSystemFreeSize;
+extern NSString *const NSURLErrorDomain;
+extern NSString *const NSUnderlyingErrorKey;
+extern double NSFoundationVersionNumber;
+extern NSString *const NSFileTypeDirectory;
+extern NSString *const NSFileTypeRegular;
+
+@interface NSEnumerator : NSObject
+- (id)nextObject;
+- (NSArray *)allObjects;
+@end
+
+@interface NSDirectoryEnumerator : NSEnumerator
+- (NSDictionary *)fileAttributes;
+- (NSDictionary *)directoryAttributes;
+- (void)skipDescendents;
+- (NSUInteger)level;
+@end
+
+typedef enum {
+  NSDirectoryEnumerationSkipsSubdirectoryDescendants = 1,
+  NSDirectoryEnumerationSkipsPackageDescendants = 2,
+  NSDirectoryEnumerationSkipsHiddenFiles = 4,
+} NSDirectoryEnumerationOptions;
+
+@interface NSFileManager : NSObject
++ (NSFileManager *)defaultManager;
+- (BOOL)isExecutableFileAtPath:(NSString *)path;
+- (NSDictionary *)attributesOfFileSystemForPath:(NSString *)path
+                                          error:(NSError **)error;
+- (NSDirectoryEnumerator *)enumeratorAtPath:(NSString *)path;
+- (NSDirectoryEnumerator *)enumeratorAtURL:(NSURL *)url
+                includingPropertiesForKeys:(NSArray *)keys
+                                   options:
+                                       (NSDirectoryEnumerationOptions)options
+                              errorHandler:(id)handler;
 @end
 
 @interface NSData : NSObject
 + (id)dataWithContentsOfURL:(NSURL *)url;
++ (instancetype)dataWithBytes:(const void *)bytes length:(NSUInteger)length;
+- (NSString *)description;
 @end
 
 @interface NSCoder : NSObject
+- (BOOL)allowsKeyedCoding;
 - (void)encodeBytes:(const uint8_t *)bytes
              length:(NSUInteger)length
              forKey:(NSString *)key;
@@ -247,6 +498,113 @@ SEL NSSelectorFromString(NSString *);
 - (void)start;
 - (BOOL)isExecuting;
 - (BOOL)isFinished;
+@end
+
+@interface NSDate : NSObject
++ (instancetype)date;
++ (instancetype)distantFuture;
++ (instancetype)dateWithTimeIntervalSinceNow:(NSTimeInterval)secs;
++ (instancetype)dateWithTimeIntervalSinceReferenceDate:(NSTimeInterval)secs;
+- (NSTimeInterval)timeIntervalSinceReferenceDate;
+@end
+
+@interface NSTimeZone : NSObject
++ (instancetype)timeZoneWithName:(NSString *)name;
++ (instancetype)timeZoneForSecondsFromGMT:(NSInteger)seconds;
+- (NSInteger)secondsFromGMT;
+- (NSString *)name;
+@end
+
+@interface NSCondition : NSObject
+- (void)lock;
+- (void)unlock;
+- (void)wait;
+- (BOOL)waitUntilDate:(NSDate *)limit;
+- (void)signal;
+- (void)broadcast;
+@end
+
+enum {
+  NSYearCalendarUnit = 1 << 2,
+  NSMonthCalendarUnit = 1 << 3,
+  NSDayCalendarUnit = 1 << 4,
+  NSHourCalendarUnit = 1 << 5,
+  NSMinuteCalendarUnit = 1 << 6,
+  NSSecondCalendarUnit = 1 << 7,
+  NSWeekdayCalendarUnit = 1 << 9,
+};
+
+@interface NSDateComponents : NSObject
+- (NSInteger)year;
+- (NSInteger)month;
+- (NSInteger)day;
+- (NSInteger)hour;
+- (NSInteger)minute;
+- (NSInteger)second;
+- (NSInteger)weekday;
+- (void)setYear:(NSInteger)value;
+- (void)setMonth:(NSInteger)value;
+- (void)setDay:(NSInteger)value;
+- (void)setHour:(NSInteger)value;
+- (void)setMinute:(NSInteger)value;
+- (void)setSecond:(NSInteger)value;
+@end
+
+extern NSString *const NSGregorianCalendar;
+
+@interface NSPort : NSObject
++ (instancetype)port;
+@end
+
+@interface NSMachPort : NSPort
+@end
+
+extern NSString *const NSDefaultRunLoopMode;
+
+@interface NSRunLoop : NSObject
++ (NSRunLoop *)currentRunLoop;
+- (void)addPort:(NSPort *)port forMode:(NSString *)mode;
+- (void)removePort:(NSPort *)port forMode:(NSString *)mode;
+- (BOOL)runMode:(NSString *)mode beforeDate:(NSDate *)limitDate;
+@end
+
+@interface NSCalendar : NSObject
+- (instancetype)initWithCalendarIdentifier:(NSString *)identifier;
+- (void)setTimeZone:(NSTimeZone *)timeZone;
+- (NSDateComponents *)components:(NSUInteger)units fromDate:(NSDate *)date;
+- (NSDate *)dateFromComponents:(NSDateComponents *)components;
+- (NSDate *)dateByAddingComponents:(NSDateComponents *)components
+                            toDate:(NSDate *)date
+                           options:(NSUInteger)options;
+- (NSDateComponents *)components:(NSUInteger)units
+                        fromDate:(NSDate *)start
+                          toDate:(NSDate *)end
+                         options:(NSUInteger)options;
+@end
+
+@interface NSOperation : NSObject
+- (void)start;
+- (void)main;
+- (void)cancel;
+- (BOOL)isCancelled;
+- (BOOL)isExecuting;
+- (BOOL)isFinished;
+- (BOOL)isConcurrent;
+- (BOOL)isReady;
+- (void)addDependency:(NSOperation *)operation;
+@end
+
+@interface NSInvocationOperation : NSOperation
+- (instancetype)initWithTarget:(id)target selector:(SEL)sel object:(id)arg;
+- (instancetype)initWithInvocation:(NSInvocation *)invocation;
+@end
+
+@interface NSOperationQueue : NSObject
+- (void)addOperation:(NSOperation *)operation;
+- (void)setMaxConcurrentOperationCount:(NSInteger)count;
+- (void)cancelAllOperations;
+- (NSUInteger)operationCount;
+- (void)waitUntilAllOperationsAreFinished;
 @end
 
 // Core Graphics
@@ -341,6 +699,9 @@ typedef struct _CGColor *CGColorRef;
 
 CGColorRef CGColorCreateGenericRGB(CGFloat red, CGFloat green, CGFloat blue,
                                    CGFloat alpha);
+size_t CGColorGetNumberOfComponents(CGColorRef color);
+const CGFloat *CGColorGetComponents(CGColorRef color);
+void CGColorRelease(CGColorRef color);
 
 // `CGColorSpace.h`
 
@@ -360,6 +721,7 @@ typedef enum {
   kCGBlendModeOverlay = 3,
   kCGBlendModeDarken = 4,
   kCGBlendModeLighten = 5,
+  kCGBlendModeClear = 16,
 } CGBlendMode;
 
 #define kCGImageAlphaPremultipliedLast 1
@@ -379,6 +741,46 @@ void CGContextSetBlendMode(CGContextRef c, CGBlendMode mode);
 void CGContextTranslateCTM(CGContextRef c, CGFloat tx, CGFloat ty);
 void CGContextScaleCTM(CGContextRef c, CGFloat sx, CGFloat sy);
 void CGContextRotateCTM(CGContextRef c, CGFloat angle);
+void CGContextBeginPath(CGContextRef c);
+void CGContextMoveToPoint(CGContextRef c, CGFloat x, CGFloat y);
+void CGContextAddRect(CGContextRef c, CGRect rect);
+void CGContextAddEllipseInRect(CGContextRef c, CGRect rect);
+void CGContextAddArcToPoint(CGContextRef c, CGFloat x1, CGFloat y1, CGFloat x2,
+                            CGFloat y2, CGFloat radius);
+void CGContextClosePath(CGContextRef c);
+void CGContextFillPath(CGContextRef c);
+void CGContextSetRGBStrokeColor(CGContextRef c, CGFloat r, CGFloat g, CGFloat b,
+                                CGFloat a);
+void CGContextSetLineWidth(CGContextRef c, CGFloat width);
+void CGContextStrokeLineSegments(CGContextRef c, const CGPoint *points,
+                                 size_t count);
+void CGContextClipToRect(CGContextRef c, CGRect rect);
+void CGContextClipToRects(CGContextRef c, const CGRect *rects, size_t count);
+
+// `CGLayer.h`
+
+typedef struct _CGLayer *CGLayerRef;
+
+CGLayerRef CGLayerCreateWithContext(CGContextRef context, CGSize size,
+                                    const void *auxiliaryInfo);
+void CGLayerRelease(CGLayerRef layer);
+CGContextRef CGLayerGetContext(CGLayerRef layer);
+CGSize CGLayerGetSize(CGLayerRef layer);
+void CGContextDrawLayerInRect(CGContextRef c, CGRect rect, CGLayerRef layer);
+void CGContextDrawLayerAtPoint(CGContextRef c, CGPoint point, CGLayerRef layer);
+
+// `CGGradient.h`
+
+typedef struct _CGGradient *CGGradientRef;
+
+CGGradientRef CGGradientCreateWithColorComponents(CGColorSpaceRef space,
+                                                  const CGFloat *components,
+                                                  const CGFloat *locations,
+                                                  size_t count);
+void CGGradientRelease(CGGradientRef gradient);
+void CGContextDrawLinearGradient(CGContextRef c, CGGradientRef gradient,
+                                 CGPoint startPoint, CGPoint endPoint,
+                                 unsigned int options);
 
 // `CGFont.h` and `CGContext.h` text functions.
 

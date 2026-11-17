@@ -10,6 +10,8 @@
 //! Resources:
 //! - [[objc explain]: Classes and metaclasses](http://www.sealiesoftware.com/blog/archive/2009/04/14/objc_explain_Classes_and_metaclasses.html), especially [the PDF diagram](http://www.sealiesoftware.com/blog/class%20diagram.pdf)
 
+use super::methods::Method;
+use super::properties::IVar;
 use super::{
     id, ivar_list_t, method_list_t, method_t, nil, objc_object, AnyHostObject, HostIMP, HostObject,
     ObjC, IMP, SEL,
@@ -38,11 +40,11 @@ pub(super) struct ClassHostObject {
     pub(super) name: String,
     pub(super) is_metaclass: bool,
     pub(super) superclass: Class,
-    pub(super) methods: HashMap<SEL, IMP>,
+    pub(super) methods: HashMap<SEL, Method>,
     pub(super) guest_method_signatures: HashMap<SEL, ConstPtr<u8>>,
-    /// Maps ivar name to a tuple of an offset (as pointer) and an alignment.
-    /// (Alignment is used during ivar reconciliation.)
-    pub(super) ivars: HashMap<String, (ConstPtr<GuestUSize>, u32)>,
+    pub(super) ivars: HashMap<String, IVar>,
+    /// Declared properties, from the class and its categories.
+    pub(super) properties: Vec<objc_property_t>,
     /// Offset into the allocated memory for the object where the ivars of
     /// instances of this class or metaclass (respectively: normal objects or
     /// classes) should live. This is always >= the value in the superclass.
@@ -112,7 +114,7 @@ struct class_rw_t {
     _base_protocols: ConstVoidPtr, // protocol list (TODO)
     ivars: ConstPtr<ivar_list_t>,
     _weak_ivar_layout: u32,
-    _base_properties: ConstVoidPtr, // property list (TODO)
+    base_properties: ConstPtr<property_list_t>,
 }
 unsafe impl SafeRead for class_rw_t {}
 
@@ -125,15 +127,26 @@ struct category_t {
     class: Class,
     instance_methods: ConstPtr<method_list_t>,
     class_methods: ConstPtr<method_list_t>,
-    _protocols: ConstVoidPtr,     // protocol list (TODO)
-    _property_list: ConstVoidPtr, // property list (TODO)
+    _protocols: ConstVoidPtr, // protocol list (TODO)
+    property_list: ConstPtr<property_list_t>,
 }
 unsafe impl SafeRead for category_t {}
 
+/// The layout of a property list in an app binary.
+#[repr(C, packed)]
+struct property_list_t {
+    entsize: GuestUSize,
+    count: GuestUSize,
+    // entries follow the struct
+}
+unsafe impl SafeRead for property_list_t {}
+
+/// The layout of a property in an app binary. As in Apple's runtime, an
+/// `objc_property_t` points to one.
 #[repr(C, packed)]
 pub struct objc_property {
-    // TODO: define fields?
-    _pad: u8,
+    name: ConstPtr<u8>,
+    attributes: ConstPtr<u8>,
 }
 unsafe impl SafeRead for objc_property {}
 
@@ -386,7 +399,13 @@ impl ClassHostObject {
                     // The selector should already have been registered by
                     // [ObjC::register_host_selectors], so we can panic
                     // if it hasn't been.
-                    (objc.selectors[name], IMP::Host(host_imp))
+                    (
+                        objc.selectors[name],
+                        Method {
+                            types: host_imp.types_string(),
+                            imp: IMP::Host(host_imp),
+                        },
+                    )
                 }),
             ),
             guest_method_signatures: HashMap::default(),
@@ -394,6 +413,7 @@ impl ClassHostObject {
             instance_start: size,
             instance_size: size,
             ivars: HashMap::default(),
+            properties: Vec::new(),
             is_initialized: InitializationStatus::NotInitialized,
         }
     }
@@ -408,6 +428,7 @@ impl ClassHostObject {
             name,
             base_methods,
             ivars,
+            base_properties,
             ..
         } = mem.read(data);
 
@@ -422,6 +443,7 @@ impl ClassHostObject {
             instance_start,
             instance_size,
             ivars: HashMap::new(),
+            properties: Vec::new(),
             is_initialized: InitializationStatus::NotInitialized,
         };
 
@@ -433,7 +455,21 @@ impl ClassHostObject {
             host_object.add_ivars_from_bin(ivars, mem);
         }
 
+        if !base_properties.is_null() {
+            host_object.add_properties_from_bin(base_properties, mem);
+        }
+
         host_object
+    }
+
+    fn add_properties_from_bin(&mut self, list: ConstPtr<property_list_t>, mem: &Mem) {
+        let property_list_t { entsize, count } = mem.read(list);
+        assert!(entsize >= guest_size_of::<objc_property>());
+        let base: ConstPtr<objc_property> = (list + 1).cast();
+        for i in 0..count {
+            self.properties
+                .push(Ptr::from_bits(base.to_bits() + i * entsize));
+        }
     }
 
     // See methods.rs for binary method parsing
@@ -463,6 +499,8 @@ fn substitute_classes(
     if !(name.starts_with("AdMob")
         || name.starts_with("AdWhirl")
         || name.starts_with("AltAds")
+        || name.starts_with("AS_") // Burstly's internal classes
+        || name.starts_with("Burstly")
         || name.starts_with("FB") // Facebook
         || name.starts_with("Flurry")
         || name.starts_with("Mobclix")
@@ -737,24 +775,31 @@ impl ObjC {
 
                 if !ivars.is_empty() {
                     let mut max_alignment: u32 = 1;
-                    for (offset, align) in ivars.values() {
-                        if offset.is_null() {
+                    for ivar in ivars.values() {
+                        if ivar.offset.is_null() {
                             // anonymous bitfield
                             continue;
                         }
-                        max_alignment = max_alignment.max(*align);
+                        // log2 of the alignment, or ~0 for a pointer's
+                        let alignment = match ivar.alignment {
+                            u32::MAX => 4,
+                            log2 => 1 << log2,
+                        };
+                        max_alignment = max_alignment.max(alignment);
                     }
 
                     let align_mask = max_alignment - 1;
                     diff = (diff + align_mask) & !align_mask;
 
-                    for (offset, _) in ivars.values_mut() {
-                        if offset.is_null() {
+                    for ivar in ivars.values_mut() {
+                        if ivar.offset.is_null() {
                             // anonymous bitfield
                             continue;
                         }
 
-                        *offset = Ptr::from_bits((*offset).to_bits() + diff);
+                        // The app's code reads the offset from this variable.
+                        let offset = mem.read(ivar.offset);
+                        mem.write(ivar.offset.cast_mut(), offset + diff);
                     }
                 }
 
@@ -918,6 +963,7 @@ impl ObjC {
                         instance_start: Default::default(),
                         instance_size: Default::default(),
                         ivars: Default::default(),
+                        properties: Default::default(),
                         is_initialized: InitializationStatus::NotInitialized,
                     },
                 );
@@ -940,6 +986,15 @@ impl ObjC {
                 );
                 host_obj.add_methods_from_bin(methods, mem, self);
                 *self.borrow_mut::<ClassHostObject>(class) = host_obj;
+            }
+
+            // As in Apple's runtime, the class gets the category's properties.
+            if !data.property_list.is_null() {
+                let any = self.get_host_object(class).unwrap().as_any();
+                if !any.is::<FakeClass>() && !any.is::<UnimplementedClass>() {
+                    self.borrow_mut::<ClassHostObject>(class)
+                        .add_properties_from_bin(data.property_list, mem);
+                }
             }
         }
     }
@@ -1005,6 +1060,45 @@ impl ObjC {
         let host_object = self.get_host_object(class).unwrap();
         matches!(host_object.as_any().downcast_ref(), Some(FakeClass { .. }))
     }
+
+    #[allow(unused)]
+    pub fn get_non_metaclass(&mut self, mem: &mut Mem, class: Class) -> Class {
+        let ClassHostObject {
+            name, is_metaclass, ..
+        } = self.borrow(class);
+        if !is_metaclass {
+            return class;
+        }
+        if let Some(nonmeta) = self.metaclass_classes.get(&class) {
+            return *nonmeta;
+        }
+        let nonmeta = self.get_known_class(&name.clone(), mem);
+        self.metaclass_classes.insert(class, nonmeta);
+        nonmeta
+    }
+
+    pub fn get_class_method(&self, class: Class, selector: SEL) -> &Method {
+        let mut class = class;
+        loop {
+            let host_object = self.get_host_object(class).unwrap();
+            if let Some(ClassHostObject {
+                superclass,
+                methods,
+                ..
+            }) = host_object.as_any().downcast_ref()
+            {
+                if let Some(method) = methods.get(&selector) {
+                    return method;
+                } else if *superclass == nil {
+                    panic!();
+                } else {
+                    class = *superclass;
+                }
+            } else {
+                panic!();
+            }
+        }
+    }
 }
 
 pub(super) fn objc_getClass(env: &mut Environment, name: ConstPtr<u8>) -> id {
@@ -1056,6 +1150,46 @@ pub(super) fn class_getProperty(
     todo!()
 }
 
+pub(super) fn class_copyPropertyList(
+    env: &mut Environment,
+    cls: Class,
+    out_count: MutPtr<u32>,
+) -> MutPtr<objc_property_t> {
+    let properties = if cls == nil {
+        Vec::new()
+    } else {
+        env.objc.borrow::<ClassHostObject>(cls).properties.clone()
+    };
+    let count: GuestUSize = properties.len().try_into().unwrap();
+    if !out_count.is_null() {
+        env.mem.write(out_count, count);
+    }
+    if count == 0 {
+        return Ptr::null();
+    }
+    // NULL-terminated, and freed by the caller with free().
+    let list: MutPtr<objc_property_t> = env
+        .mem
+        .alloc((count + 1) * guest_size_of::<objc_property_t>())
+        .cast();
+    for (i, property) in properties.into_iter().enumerate() {
+        env.mem.write(list + i.try_into().unwrap(), property);
+    }
+    env.mem.write(list + count, Ptr::null());
+    list
+}
+
+pub(super) fn property_getName(env: &mut Environment, property: objc_property_t) -> ConstPtr<u8> {
+    env.mem.read(property).name
+}
+
+pub(super) fn property_getAttributes(
+    env: &mut Environment,
+    property: objc_property_t,
+) -> ConstPtr<u8> {
+    env.mem.read(property).attributes
+}
+
 pub(super) fn class_replaceMethod(
     env: &mut Environment,
     cls: Class,
@@ -1077,19 +1211,21 @@ pub(super) fn class_replaceMethod(
             imp,
             name.as_str(&env.mem)
         );
-        e.insert(imp);
+        let types = env.mem.cstr_at_utf8(types).unwrap().to_owned();
+        e.insert(Method { types, imp });
         guest_method_signatures.insert(name, types_copy);
         return IMP::guest_null();
     }
     env.mem.free(types_copy.cast().cast_mut());
     // TODO: use `method_setImplementation` once implemented
     // Note: encoding types are ignored
-    let existing = methods.insert(name, imp.clone()).unwrap();
+    let method = methods.get_mut(&name).unwrap();
+    let existing = std::mem::replace(&mut method.imp, imp);
     assert!(matches!(existing, IMP::Guest(_))); // TODO
     log_dbg!(
         "class_replaceMethod: existing {:?} replaced with {:?} for method {}",
         existing,
-        imp,
+        method.imp,
         name.as_str(&env.mem)
     );
     existing
@@ -1106,7 +1242,7 @@ pub(super) fn class_getInstanceMethod(
             return Ptr::null();
         }
         let host_object: &ClassHostObject = env.objc.borrow(class);
-        match host_object.methods.get(&name) {
+        match host_object.methods.get(&name).map(|method| &method.imp) {
             Some(IMP::Guest(imp)) => {
                 let types = host_object.guest_method_signatures.get(&name);
                 break (Some(*imp), types.copied().unwrap_or(Ptr::null()));
@@ -1151,9 +1287,9 @@ pub(super) fn class_getMethodImplementation(env: &mut Environment, cls: Class, n
             ..
         } = env.objc.borrow(class);
         if methods.contains_key(&name) {
-            let method = methods.get(&name).unwrap().clone();
-            assert!(matches!(method, IMP::Guest(_))); // TODO
-            return method;
+            let method = methods.get(&name).unwrap();
+            assert!(matches!(method.imp, IMP::Guest(_))); // TODO
+            return method.imp.clone();
         } else if next == nil {
             // TODO: currently this returns NULL for unimplemented host methods
             return IMP::guest_null();

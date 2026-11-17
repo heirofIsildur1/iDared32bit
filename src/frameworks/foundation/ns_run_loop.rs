@@ -21,7 +21,8 @@ use crate::frameworks::{core_animation, media_player, uikit};
 use crate::libc::semaphore::{host_create_semaphore, sem_post, sem_t};
 use crate::mem::MutPtr;
 use crate::objc::{
-    id, msg, msg_send, nil, objc_classes, release, retain, Class, ClassExports, HostObject, SEL,
+    id, msg, msg_class, msg_send, msg_send_no_type_checking, nil, objc_classes, release, retain,
+    Class, ClassExports, HostObject, SEL,
 };
 use crate::Environment;
 use std::collections::VecDeque;
@@ -59,6 +60,10 @@ struct NSRunLoopHostObject {
     /// Strong references to `NSTimer*` in no particular order. Timers are owned
     /// by the run loop. The timer must remove itself when invalidated.
     timers: Vec<id>,
+    /// Strong references to `NSPort*`, in the order they were added.
+    ports: Vec<id>,
+    /// Set by `CFRunLoopStop`, cleared when the run loop stops.
+    stopped: bool,
 }
 impl HostObject for NSRunLoopHostObject {}
 
@@ -119,13 +124,63 @@ pub const CLASSES: ClassExports = objc_classes! {
     ns_timer::set_run_loop(env, timer, this);
 }
 
+- (())addPort:(id)port // NSPort*
+       forMode:(NSRunLoopMode)mode {
+    let default_mode = ns_string::get_static_str(env, NSDefaultRunLoopMode);
+    let common_modes = ns_string::get_static_str(env, NSRunLoopCommonModes);
+    // TODO: handle other modes
+    assert!(msg![env; mode isEqualToString:default_mode] || msg![env; mode isEqualToString:common_modes]);
+
+    let ports = &env.objc.borrow::<NSRunLoopHostObject>(this).ports;
+    if !ports.contains(&port) {
+        retain(env, port);
+        env.objc.borrow_mut::<NSRunLoopHostObject>(this).ports.push(port);
+    }
+}
+
+- (())removePort:(id)port // NSPort*
+          forMode:(NSRunLoopMode)_mode {
+    let ports = &mut env.objc.borrow_mut::<NSRunLoopHostObject>(this).ports;
+    if let Some(i) = ports.iter().position(|&p| p == port) {
+        ports.remove(i);
+        release(env, port);
+    }
+}
+
 - (())run {
-    run_run_loop(env, this, /* single_iteration: */ false, None);
+    // Like Apple's, CFRunLoopStop doesn't end this, it just runs again.
+    loop {
+        run_run_loop(env, this, /* single_iteration: */ false, None);
+    }
 }
 
 - (())runUntilDate:(id)date {
     let time_limit: NSTimeInterval = msg![env; date timeIntervalSince1970];
     run_run_loop(env, this, /* single_iteration: */ false, Some(time_limit));
+}
+
+- (bool)runMode:(NSRunLoopMode)mode beforeDate:(id)date {
+    let default_mode = ns_string::get_static_str(env, NSDefaultRunLoopMode);
+    let common_modes = ns_string::get_static_str(env, NSRunLoopCommonModes);
+    // TODO: handle other modes
+    assert!(msg![env; mode isEqualToString:default_mode] || msg![env; mode isEqualToString:common_modes]);
+
+    // With nothing attached, it can't run. The main run loop always has
+    // UIKit's event handling.
+    let host_object = env.objc.borrow::<NSRunLoopHostObject>(this);
+    let has_sources = env.current_thread == 0
+        || !host_object.timers.is_empty()
+        || !host_object.ports.is_empty()
+        || !host_object.selector_objects.is_empty()
+        || !host_object.audio_queues.is_empty()
+        || !host_object.audio_units.is_empty();
+    if !has_sources {
+        return false;
+    }
+
+    let time_limit: NSTimeInterval = msg![env; date timeIntervalSince1970];
+    run_run_loop_inner(env, this, false, Some(time_limit), true);
+    true
 }
 
 // TODO: other run methods
@@ -252,23 +307,26 @@ pub(super) fn cancel_perform_requests(
     env: &mut Environment,
     run_loop: id,
     target: id,
-    selector: SEL,
+    // None cancels all of the target's requests, whatever their argument.
+    selector: Option<SEL>,
     argument: id,
 ) {
     log_dbg!(
         "Removing object selector request {target:?} {:?} {argument:?} on run loop {run_loop:?}",
-        selector.as_str(env.mem.as_mut())
+        selector.map(|selector| selector.as_str(env.mem.as_mut()))
     );
     let mut new_selector_objects = VecDeque::new();
     let host_object = env.objc.borrow_mut::<NSRunLoopHostObject>(run_loop);
     let mut selector_objects = std::mem::take(&mut host_object.selector_objects);
     while let Some(obj) = selector_objects.pop_front() {
-        if obj.target != target || obj.selector != selector {
+        if obj.target != target || selector.is_some_and(|selector| obj.selector != selector) {
             new_selector_objects.push_back(obj);
             continue;
         }
         let curr_arg = obj.argument;
-        let arg_equal = if curr_arg.is_null() {
+        let arg_equal = if selector.is_none() {
+            true
+        } else if curr_arg.is_null() {
             argument.is_null()
         } else {
             msg![env; curr_arg isEqual:argument]
@@ -294,6 +352,11 @@ pub(super) fn cancel_perform_requests(
         .selector_objects = new_selector_objects;
 }
 
+/// For use by `CFRunLoopStop`.
+pub fn stop_run_loop(env: &mut Environment, run_loop: id) {
+    env.objc.borrow_mut::<NSRunLoopHostObject>(run_loop).stopped = true;
+}
+
 /// Run the run loop for just a single iteration. This is a special mode just
 /// for the app picker, since we don't have `runMode:beforeDate:` yet.
 /// (TODO: implement those to replace this.)
@@ -307,6 +370,19 @@ pub fn run_run_loop(
     single_iteration: bool,
     unix_time_limit: Option<f64>,
 ) {
+    run_run_loop_inner(env, run_loop, single_iteration, unix_time_limit, false);
+}
+
+/// Like [run_run_loop], but can also stop once an input source (not a timer)
+/// has been handled, as `runMode:beforeDate:` does.
+fn run_run_loop_inner(
+    env: &mut Environment,
+    run_loop: id,
+    single_iteration: bool,
+    unix_time_limit: Option<f64>,
+    stop_after_source: bool,
+) {
+    let mut handled_source = false;
     if single_iteration {
         log_dbg!(
             "Entering run loop {:?} (single iteration), limit {:?}",
@@ -345,11 +421,21 @@ pub fn run_run_loop(
         //  committed automatically when the thread’s runloop next iterates."
         ca_transaction::ThreadLocalState::commit_implicit_transaction(env);
 
+        // Like UIKit's main run loop, drain a pool each iteration, so objects
+        // autoreleased by, for example, animation delegates, timers or movie
+        // notifications don't pile up in the app's outermost pool.
+        let pool: id = if is_main_run_loop {
+            msg_class![env; NSAutoreleasePool new]
+        } else {
+            nil
+        };
+
         // We want to process those only on the main run loop
         if is_main_run_loop {
             let next_due = uikit::handle_events(env);
             limit_sleep_time(&mut sleep_until, next_due);
 
+            uikit::ui_view::layout_if_needed(env);
             let next_due = core_animation::recomposite_if_necessary(env, false);
             limit_sleep_time(&mut sleep_until, next_due);
         }
@@ -416,9 +502,10 @@ pub fn run_run_loop(
                     log_dbg!("Running object selector request {target:?} {:?} {argument:?} on run loop {run_loop:?}", selector.as_str(env.mem.as_mut()));
 
                     if selector.as_str(&env.mem).ends_with(':') {
-                        () = msg_send(env, (target, selector, argument));
+                        // The method may take a non-object argument.
+                        () = msg_send_no_type_checking(env, (target, selector, argument));
                     } else {
-                        assert!(argument.is_null());
+                        // As on a device, a method without one ignores it.
                         () = msg_send(env, (target, selector));
                     }
 
@@ -428,6 +515,7 @@ pub fn run_run_loop(
                     if !semaphore.is_null() {
                         sem_post(env, semaphore);
                     }
+                    handled_source = true;
                 }
                 None => {
                     for oss in selector_objects {
@@ -440,6 +528,11 @@ pub fn run_run_loop(
 
         if is_main_run_loop {
             media_player::handle_players(env);
+            release(env, pool);
+        }
+
+        if stop_after_source && handled_source {
+            break;
         }
 
         // Unfortunately, touchHLE has to poll for certain things repeatedly;
@@ -459,7 +552,8 @@ pub fn run_run_loop(
         let limit = Duration::from_millis(1000 / 60);
         env.sleep(sleep_until.map_or(limit, |i| i.duration_since(Instant::now()).min(limit)));
 
-        if single_iteration {
+        let stopped = &mut env.objc.borrow_mut::<NSRunLoopHostObject>(run_loop).stopped;
+        if single_iteration || std::mem::take(stopped) {
             break;
         }
 
@@ -480,6 +574,12 @@ pub fn run_run_loop(
     }
 }
 
+/// The run loop of a thread, made if it doesn't have one yet.
+pub(super) fn run_loop_for_thread_id(env: &mut Environment, thread_id: ThreadId) -> id {
+    let class = env.objc.get_known_class("NSRunLoop", &mut env.mem);
+    run_loop_for_thread(env, class, thread_id)
+}
+
 /// Helper method for `mainRunLoop` and `currentRunLoop` NSThread class methods
 fn run_loop_for_thread(env: &mut Environment, this: Class, thread_id: ThreadId) -> id {
     if env.threads[thread_id]
@@ -494,6 +594,8 @@ fn run_loop_for_thread(env: &mut Environment, this: Class, thread_id: ThreadId) 
             audio_queues: Vec::new(),
             selector_objects: VecDeque::new(),
             timers: Vec::new(),
+            ports: Vec::new(),
+            stopped: false,
         });
         // TODO: is it OK to allocate static object for all threads,
         // not only main one?
