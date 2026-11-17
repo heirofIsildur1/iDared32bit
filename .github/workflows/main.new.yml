@@ -1,0 +1,89 @@
+name: Build iDared32bit Unsigned IPA
+#here is to yet another attempt
+on:
+  push:
+    branches: [ "main", "idared32bit" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # dynarmic (the CPU core) needs Boost headers; build.rs picks up vendor/boost
+      - name: Cache Boost
+        id: cache-boost
+        uses: actions/cache@v4
+        with:
+          path: vendor/boost
+          key: boost_1_81_0_headers
+
+      - name: Download Boost
+        if: steps.cache-boost.outputs.cache-hit != 'true'
+        run: |
+          curl -L -o boost.tar.gz "https://archives.boost.io/release/1.81.0/source/boost_1_81_0.tar.gz"
+          mkdir -p vendor
+          tar xzf boost.tar.gz -C vendor
+          mv vendor/boost_1_81_0 vendor/boost
+
+      - name: Select newest stable Xcode 26 (iOS 26 SDK)
+        run: |
+          XCODE=$(ls -d /Applications/Xcode_26.*.app | grep -vi -e beta -e candidate | sort -V | tail -n 1)
+          echo "Using $XCODE"
+          sudo xcode-select -s "$XCODE"
+          xcodebuild -version
+          xcodebuild -showsdks | grep -i "iOS"
+
+      - name: Install Rust iOS targets
+        run: |
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+
+      - name: Build Unsigned App
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project iphone/iDared32bit.xcodeproj \
+            -scheme "iDared 32bit" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build 2>&1 | tee xcodebuild.log
+
+      - name: Show errors on failure
+        if: failure()
+        run: |
+          echo "=== error lines ==="
+          grep -n -E "error:|error\[|fatal error|BUILD FAILED|failed with exit code" xcodebuild.log | head -60
+          echo "=== last 60 lines ==="
+          tail -n 60 xcodebuild.log
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log
+          path: xcodebuild.log
+
+      - name: Package Unsigned IPA
+        run: |
+          APP=$(find build/Build/Products -maxdepth 2 -name "*.app" | head -n 1)
+          echo "Found app: $APP"
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -qry iDared32bit-Unsigned.ipa Payload
+
+      - name: Upload Unsigned IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: iDared32bit-unsigned-ipa
+          path: iDared32bit-Unsigned.ipa
+          if-no-files-found: error
